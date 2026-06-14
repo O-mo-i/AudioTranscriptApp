@@ -1,0 +1,23 @@
+# Build
+Build/
+cmake-build-*/
+
+# JUCE framework (external dependency)
+JUCE/
+
+# Python virtual environment
+scripts/.venv/
+__pycache__/
+*.pyc
+
+# IDE
+.vs/
+*.sln
+*.suo
+*.user
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
