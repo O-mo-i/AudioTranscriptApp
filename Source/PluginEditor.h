@@ -59,16 +59,22 @@ private:
         return currentRegion != nullptr ? currentRegion->getTimeRange().getStart() : 0.0;
     }
 
-    /** 音频块相对时间 → 宿主绝对时间线 */
-    double relativeToAbsolute(double relTime) const noexcept
+    /** 切片在音频源中的物理起点偏移（用于时间换算） */
+    double getViewStart() const noexcept
     {
-        return getRegionPlaybackStart() + relTime;
+        return currentRegion != nullptr ? currentRegion->getStartInAudioModificationTime() : 0.0;
     }
 
-    /** 宿主绝对时间线 → 音频块相对时间 */
-    double absoluteToRelative(double absTime) const noexcept
+    /** 音频源相对时间（阿字级时间戳）→ 宿主绝对时间线 */
+    double sourceTimeToAbsolute(double sourceTime) const noexcept
     {
-        return absTime - getRegionPlaybackStart();
+        return getRegionPlaybackStart() + (sourceTime - getViewStart());
+    }
+
+    /** 宿主绝对时间线 → 音频源相对时间（阿字级时间戳） */
+    double absoluteToSourceTime(double absTime) const noexcept
+    {
+        return absTime - getRegionPlaybackStart() + getViewStart();
     }
 
     //── ARA 选择变化 ────────────────────────

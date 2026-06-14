@@ -264,9 +264,9 @@ void TranscriptPluginEditor::timerCallback()
     double absPos = phs.timeInSeconds.load(std::memory_order_relaxed);
 
     // 实时换算为音频块相对时间
-    double relPos = juce::jmax(0.0, absoluteToRelative(absPos));
+    double sourceRelTime = juce::jmax(0.0, absoluteToSourceTime(absPos));
 
-    waveform.setPlayheadPosition(relPos);
+    waveform.setPlayheadPosition(sourceRelTime);
 
     //── 定时轮询当前 ARA 选区（兜底跨轨断链） ──
     if (++selectionPollCounter >= 15)  // 每隔 ~500ms 检查一次
@@ -280,12 +280,12 @@ void TranscriptPluginEditor::timerCallback()
 
     for (const auto& ts : *currentTimestamps)
     {
-        if (relPos >= ts.startTime && relPos < ts.endTime)
+        if (sourceRelTime >= ts.startTime && sourceRelTime < ts.endTime)
         {
             if (ts.globalTextIndex != lastHighlightedCharIndex)
             {
                 lastHighlightedCharIndex = ts.globalTextIndex;
-                transcriptEditor.highlightByTime(relPos);
+                transcriptEditor.highlightByTime(sourceRelTime);
             }
             return;
         }
@@ -460,7 +460,7 @@ void TranscriptPluginEditor::syncTextToAudio(int charIndex)
 
     waveform.setPlayheadPosition(wordTime);
 
-    double absoluteHostTime = relativeToAbsolute(wordTime);
+    double absoluteHostTime = sourceTimeToAbsolute(wordTime);
 
     if (auto* editorView = getARAEditorView())
     {
@@ -481,7 +481,7 @@ void TranscriptPluginEditor::syncAudioToText(double timeInSeconds)
     transcriptEditor.highlightByTime(timeInSeconds);
 
     // 实时换算为宿主绝对时间线
-    double absoluteHostTime = relativeToAbsolute(timeInSeconds);
+    double absoluteHostTime = sourceTimeToAbsolute(timeInSeconds);
     if (auto* editorView = getARAEditorView())
     {
         auto* dc = editorView->getDocumentController();
