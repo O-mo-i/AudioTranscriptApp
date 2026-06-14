@@ -1,0 +1,602 @@
+#include "PluginEditor.h"
+#include "PluginProcessor.h"
+#include "ARADocumentController.h"
+#include <juce_audio_basics/juce_audio_basics.h>
+#include <juce_audio_formats/juce_audio_formats.h>
+
+//==============================================================================
+//  在构造中获取 ARA 文档控制器的引用（用于数据同步）
+static TranscriptDocumentController* getTranscriptDocumentController(juce::AudioProcessorEditorARAExtension& editor)
+{
+    if (auto* ev = editor.getARAEditorView())
+    {
+        auto* rawDC = ev->getDocumentController();
+        return juce::ARADocumentControllerSpecialisation::
+            getSpecialisedDocumentController<TranscriptDocumentController>(rawDC);
+    }
+    return nullptr;
+}
+
+//==============================================================================
+TranscriptPluginEditor::TranscriptPluginEditor(TranscriptPluginProcessor& p)
+    : juce::AudioProcessorEditor(&p),
+      juce::AudioProcessorEditorARAExtension(&p),
+      processor(p),
+      asrProgressBar(asrProgressValue)
+{
+    //── 文档控制器引用（用于数据同步 & 存档恢复） ──
+    auto* documentController = getTranscriptDocumentController(*this);
+
+    //── 数据管理器（以物理 ARAAudioSource* 为键） ────
+    dataManager = &processor.getDataManager();
+    dataManager->onActiveSourceChanged = [this](juce::ARAAudioSource* src)
+    {
+        onActiveSourceChanged(src);
+    };
+
+    //── ARA 选择变化监听 ────────────────────
+    if (auto* editorView = getARAEditorView())
+    {
+        editorView->addListener(this);
+        onNewSelection(editorView->getViewSelection());
+    }
+
+    // 强制刷新 UI：编辑器可能关闭后重开
+    if (auto* src = dataManager->getActiveSource())
+        onActiveSourceChanged(src);
+
+    //── 存档恢复后刷新 UI ─────────────────────
+    if (documentController)
+    {
+        documentController->onDataRestored = [this]()
+        {
+            if (auto* editorView = getARAEditorView())
+            {
+                auto sel = editorView->getViewSelection();
+                auto regions = sel.getPlaybackRegions<juce::ARAPlaybackRegion>();
+                if (!regions.empty())
+                {
+                    auto* audioMod = regions.front()->getAudioModification<juce::ARAAudioModification>();
+                    if (auto* src = audioMod->getAudioSource())
+                    {
+                        dataManager->setActiveSource(src);
+                        return;  // setActiveSource 已触发 onActiveSourceChanged
+                    }
+                }
+            }
+            // 没有选区：至少刷新一下当前状态
+            onActiveSourceChanged(dataManager->getActiveSource());
+        };
+    }
+
+    //── 进度条（8px 细条） ────────────────────
+    addAndMakeVisible(waveform);
+    waveform.onTimeSelected = [this](double t) { syncAudioToText(t); };
+
+    //── 转录文本 ────────────────────────────
+    addAndMakeVisible(transcriptEditor);
+    transcriptEditor.setTimestamps(nullptr);
+    transcriptEditor.onCaretMoved = [this](int i) { syncTextToAudio(i); };
+    transcriptEditor.onSpacePressed = [this]() -> bool
+    {
+        auto& phs = processor.getPlayHeadState();
+        if (auto* editorView = getARAEditorView())
+        {
+            auto* dc = editorView->getDocumentController();
+            if (auto* playbackCtrl = dc->getHostPlaybackController())
+            {
+                bool isPlaying = phs.isPlaying.load(std::memory_order_relaxed);
+                if (isPlaying)
+                    playbackCtrl->requestStopPlayback();
+                else
+                    playbackCtrl->requestStartPlayback();
+                return true;
+            }
+        }
+        return false;
+    };
+
+    //── ASR 控件 ────────────────────────────
+    modelSelector.addItem("Qwen/Qwen3-ASR-0.6B", 1);
+    modelSelector.addItem("openai/whisper-small", 2);
+    modelSelector.addItem("openai/whisper-medium", 3);
+    modelSelector.addItem("openai/whisper-large-v3", 4);
+    modelSelector.setSelectedId(1);
+    modelSelector.setTooltip(juce::String::fromUTF8("\xe9\x80\x89\xe6\x8b\xa9 ASR \xe8\xaf\x86\xe5\x88\xab\xe6\xa8\xa1\xe5\x9e\x8b"));
+    addAndMakeVisible(modelSelector);
+
+    asrButton.setButtonText("ASR");
+    asrButton.onClick = [this] { startASR(); };
+    asrButton.setEnabled(false);
+    addAndMakeVisible(asrButton);
+
+    asrStatusLabel.setText(juce::String::fromUTF8("\xe5\x9c\xa8 Studio One \xe4\xb8\xad\xe9\x80\x89\xe4\xb8\xad\xe9\x9f\xb3\xe9\xa2\x91\xe7\x89\x87\xe6\xae\xb5\xe5\x90\x8e\xe5\x8f\xaf\xe8\xbf\x9b\xe8\xa1\x8c ASR \xe8\xaf\x86\xe5\x88\xab"),
+                           juce::dontSendNotification);
+    asrStatusLabel.setColour(juce::Label::textColourId, juce::Colours::grey);
+    asrStatusLabel.setJustificationType(juce::Justification::centred);
+    addAndMakeVisible(asrStatusLabel);
+
+    asrProgressBar.setTextToDisplay({});
+    asrProgressBar.setVisible(false);
+    addAndMakeVisible(asrProgressBar);
+
+    //── ASR 回调 ────────────────────────────
+    auto cleanupTemp = [this]()
+    {
+        if (tempAudioFile.exists())
+        {
+            tempAudioFile.deleteFile();
+            tempAudioFile = {};
+        }
+    };
+
+    asrProcessor.onResult = [this, cleanupTemp, documentController](const std::vector<CharacterTimestamp>& timestamps,
+                                                  const juce::String& fullText)
+    {
+        cleanupTemp();
+        asrProgressBar.setVisible(false);
+
+        auto key = dataManager->getActiveKey();
+        if (key.isEmpty()) return;
+
+        // 同时存入 Processor 层和文档控制器的 dataManager
+        dataManager->setASRResult(key, timestamps, fullText);
+        if (documentController)
+            documentController->getDataManager().setASRResult(key, timestamps, fullText);
+        if (auto* activeSrc = dataManager->getActiveSource())
+            onActiveSourceChanged(activeSrc);
+
+        asrStatusLabel.setText(juce::String::fromUTF8("ASR \xe8\xaf\x86\xe5\x88\xab\xe5\xae\x8c\xe6\x88\x90"),
+                               juce::dontSendNotification);
+        asrStatusLabel.setColour(juce::Label::textColourId, juce::Colours::greenyellow);
+        asrButton.setEnabled(true);
+        transcriptEditor.setCaretPosition(0);
+    };
+
+    asrProcessor.onError = [this, cleanupTemp](const juce::String& errorMsg)
+    {
+        cleanupTemp();
+        asrProgressBar.setVisible(false);
+        asrStatusLabel.setText(juce::String::fromUTF8("ASR \xe9\x94\x99\xe8\xaf\xaf: ") + errorMsg,
+                               juce::dontSendNotification);
+        asrStatusLabel.setColour(juce::Label::textColourId, juce::Colours::orangered);
+        asrButton.setEnabled(true);
+    };
+
+    asrProcessor.onProgress = [this](double pct)
+    {
+        asrProgressValue = pct;
+        asrProgressBar.repaint();
+    };
+
+    startTimerHz(30);
+    selectionPollCounter = 0;
+
+    setResizable(true, false);
+    setResizeLimits(600, 300, 3000, 2000);
+    setSize(1200, 750);
+}
+
+TranscriptPluginEditor::~TranscriptPluginEditor()
+{
+    stopTimer();
+    asrProcessor.cancel();
+
+    if (currentRegion)
+        currentRegion->removeListener(this);
+
+    if (auto* editorView = getARAEditorView())
+        editorView->removeListener(this);
+
+    if (tempAudioFile.exists())
+        tempAudioFile.deleteFile();
+}
+
+//==============================================================================
+void TranscriptPluginEditor::refreshAfterStateRestore()
+{
+    if (auto* editorView = getARAEditorView())
+    {
+        auto sel = editorView->getViewSelection();
+        auto regions = sel.getPlaybackRegions<juce::ARAPlaybackRegion>();
+        if (!regions.empty())
+        {
+            auto* audioMod = regions.front()->getAudioModification<juce::ARAAudioModification>();
+            if (auto* src = audioMod->getAudioSource())
+            {
+                dataManager->setActiveSource(src);
+                return;
+            }
+        }
+    }
+    onActiveSourceChanged(dataManager->getActiveSource());
+}
+
+//==============================================================================
+void TranscriptPluginEditor::paint(juce::Graphics& g)
+{
+    g.fillAll(juce::Colour(0xFF1a1a2e));
+
+    if (getARAEditorView() == nullptr)
+    {
+        g.setColour(juce::Colours::white);
+        g.setFont(juce::Font(18.0f));
+        g.drawFittedText(juce::String::fromUTF8(
+            "\xe6\xad\xa4\xe6\x8f\x92\xe4\xbb\xb6\xe4\xbb\x85\xe6\x94\xaf\xe6\x8c\x81"
+            "\xe5\x9c\xa8 Studio One ARA \xe6\xa8\xa1\xe5\xbc\x8f\xe4\xb8\x8b\xe8\xbf"
+            "\x90\xe8\xa1\x8c\xe3\x80\x82"),
+                         getLocalBounds(), juce::Justification::centred, 1);
+    }
+}
+
+void TranscriptPluginEditor::resized()
+{
+    auto bounds = getLocalBounds().reduced(8);
+
+    auto controlArea = bounds.removeFromBottom(44);
+
+    auto topStrip = bounds.removeFromTop(28);
+    auto statusArea  = topStrip.removeFromTop(20);
+    auto waveArea    = topStrip;
+
+    asrStatusLabel.setBounds(statusArea);
+    waveform.setBounds(waveArea);
+
+    transcriptEditor.setBounds(bounds);
+
+    asrProgressBar.setBounds(getWidth() - 350, 5, 340, 14);
+
+    const int btnW = 100;
+    const int comboW = 220;
+    const int gap = 4;
+
+    modelSelector.setBounds(controlArea.removeFromLeft(comboW).reduced(gap));
+    asrButton.setBounds(controlArea.removeFromLeft(btnW).reduced(gap));
+}
+
+//==============================================================================
+//  定时器：轮询播放头位置并驱动进度条 + 文本高亮
+//==============================================================================
+void TranscriptPluginEditor::timerCallback()
+{
+    auto& phs = processor.getPlayHeadState();
+    bool isPlaying = phs.isPlaying.load(std::memory_order_relaxed);
+    double absPos = phs.timeInSeconds.load(std::memory_order_relaxed);
+
+    // 实时换算为音频块相对时间
+    double relPos = juce::jmax(0.0, absoluteToRelative(absPos));
+
+    waveform.setPlayheadPosition(relPos);
+
+    //── 定时轮询当前 ARA 选区（兜底跨轨断链） ──
+    if (++selectionPollCounter >= 15)  // 每隔 ~500ms 检查一次
+    {
+        selectionPollCounter = 0;
+        pollSelectionChanged();
+    }
+
+    if (!isPlaying || currentTimestamps == nullptr)
+        return;
+
+    for (const auto& ts : *currentTimestamps)
+    {
+        if (relPos >= ts.startTime && relPos < ts.endTime)
+        {
+            if (ts.globalTextIndex != lastHighlightedCharIndex)
+            {
+                lastHighlightedCharIndex = ts.globalTextIndex;
+                transcriptEditor.highlightByTime(relPos);
+            }
+            return;
+        }
+    }
+}
+
+//==============================================================================
+//  定时轮询选区 —— 跨轨移动后 ARAEditorView::Listener 可能断链，
+//  本方法通过 timer 主动查询当前选区，确保数据不丢失。
+//==============================================================================
+void TranscriptPluginEditor::pollSelectionChanged()
+{
+    if (auto* editorView = getARAEditorView())
+    {
+        auto selection = editorView->getViewSelection();
+        auto regions = selection.getPlaybackRegions<juce::ARAPlaybackRegion>();
+        if (regions.empty())
+            return;
+
+        auto* region = regions.front();
+        auto* audioMod = region->getAudioModification<juce::ARAAudioModification>();
+        auto* audioSource = audioMod->getAudioSource();
+
+        // 与当前 activeSource 对比，不一样则触发切换
+        if (audioSource != nullptr && audioSource != dataManager->getActiveSource())
+            onNewSelection(selection);
+    }
+}
+
+//==============================================================================
+//  计算当前切片在物理音频源中的视口时间区间
+//
+//  直接使用 ARA 官方时轴映射：
+//    getStartInAudioModificationTime() — 切片在物理音频修改中的绝对起点
+//    getDurationInAudioModificationTime() — 切片在物理音频修改中的持续时长
+//  这两个值由 Studio One 底层直接设置，不受播放位置、排序影响。
+//==============================================================================
+juce::Range<double> TranscriptPluginEditor::getCurrentViewRange() const
+{
+    if (currentRegion == nullptr)
+        return {0.0, std::numeric_limits<double>::max()};
+
+    auto viewStart = currentRegion->getStartInAudioModificationTime();
+    auto viewEnd   = currentRegion->getEndInAudioModificationTime();
+
+    return {viewStart, viewEnd};
+}
+void TranscriptPluginEditor::onNewSelection(const juce::ARAViewSelection& selection)
+{
+    auto regions = selection.getPlaybackRegions<juce::ARAPlaybackRegion>();
+    if (regions.empty())
+        return;
+
+    // 解除旧区域的监听
+    if (currentRegion)
+        currentRegion->removeListener(this);
+
+    currentRegion = regions.front();
+    auto* audioMod = currentRegion->getAudioModification<juce::ARAAudioModification>();
+    auto* audioSource = audioMod->getAudioSource();
+
+    // 监听新区域的属性变化（用户拖动时更新时轴偏移）
+    currentRegion->addListener(this);
+
+    if (audioSource != nullptr)
+        dataManager->setActiveSource(audioSource);
+}
+
+//==============================================================================
+//  ARA 播放区域属性即将变化 —— 用户拖动音频块时触发
+//==============================================================================
+void TranscriptPluginEditor::willUpdatePlaybackRegionProperties(
+    juce::ARAPlaybackRegion* region,
+    juce::ARAPlaybackRegion::PropertiesPtr newProperties)
+{
+    juce::ignoreUnused(region, newProperties);
+    // currentRegion 的 TimeRange 在属性更新后会自动反映新位置，
+    // 我们只需确保各成员方法在每次调用时实时读取 getRegionPlaybackStart()
+    // 不需要手动缓存任何值。
+}
+
+//==============================================================================
+//  激活源切换 —— 刷新进度条和文本
+//==============================================================================
+void TranscriptPluginEditor::onActiveSourceChanged(juce::ARAAudioSource* source)
+{
+    lastHighlightedCharIndex = -1;
+
+    if (source == nullptr)
+    {
+        waveform.setAudioSource(nullptr);
+        transcriptEditor.clear();
+        transcriptEditor.setTimestamps(nullptr);
+        currentTimestamps = nullptr;
+        asrButton.setEnabled(false);
+        asrStatusLabel.setText(juce::String::fromUTF8(
+            "\xe8\xaf\xb7\xe9\x80\x89\xe4\xb8\xad\xe4\xb8\x80\xe4\xb8\xaa\xe9\x9f\xb3"
+            "\xe9\xa2\x91\xe7\x89\x87\xe6\xae\xb5"),
+                               juce::dontSendNotification);
+        asrStatusLabel.setColour(juce::Label::textColourId, juce::Colours::grey);
+        return;
+    }
+
+    waveform.setAudioSource(source);
+
+    auto key = TranscriptDataManager::makeSourceKey(source);
+    auto* data = dataManager->getDataForKey(key);
+    if (data != nullptr && data->asrComplete)
+    {
+        // 按当前视口过滤：直接用时间戳判断，逐字重织新文本
+        auto viewRange = getCurrentViewRange();
+        DBG("====== [VIEW RANGE CHECK] ======");
+        DBG("viewStart: " + juce::String(viewRange.getStart()));
+        DBG("viewEnd:   " + juce::String(viewRange.getEnd()));
+        DBG("Total source timestamps: " + juce::String((int)data->timestamps.size()));
+        DBG("================================");
+        filteredTimestamps.clear();
+        filteredFullText.clear();
+
+        for (size_t i = 0; i < data->timestamps.size(); ++i)
+        {
+            const auto& ts = data->timestamps[i];
+
+            // 只通过时间戳判断是否在当前切片视口内
+            if (ts.startTime >= viewRange.getStart() && ts.startTime < viewRange.getEnd())
+            {
+                // 段落首字：补换行 + MM:SS 时间标签
+                if (ts.isParagraphStart && !filteredFullText.isEmpty())
+                {
+                    filteredFullText += "\n";
+                    int totalSec = juce::roundToInt(ts.startTime);
+                    filteredFullText += juce::String::formatted("%02d:%02d ",
+                        totalSec / 60, totalSec % 60);
+                }
+
+                auto adjusted = ts;
+                adjusted.globalTextIndex = filteredFullText.length();
+                filteredFullText += ts.character;
+                filteredTimestamps.push_back(adjusted);
+            }
+        }
+
+        transcriptEditor.setText(filteredFullText, juce::dontSendNotification);
+        transcriptEditor.setTimestamps(&filteredTimestamps);
+        currentTimestamps = &filteredTimestamps;
+        asrButton.setEnabled(true);
+        asrStatusLabel.setText(juce::String::fromUTF8("ASR \xe5\xb7\xb2\xe5\xae\x8c\xe6\x88\x90"),
+                               juce::dontSendNotification);
+        asrStatusLabel.setColour(juce::Label::textColourId, juce::Colours::greenyellow);
+    }
+    else
+    {
+        transcriptEditor.clear();
+        transcriptEditor.setTimestamps(nullptr);
+        currentTimestamps = nullptr;
+        asrButton.setEnabled(true);
+        asrStatusLabel.setText(juce::String::fromUTF8(
+            "\xe7\x82\xb9\xe5\x87\xbb ASR \xe5\xbc\x80\xe5\xa7\x8b\xe8\xaf\x86\xe5\x88\xab"),
+                               juce::dontSendNotification);
+        asrStatusLabel.setColour(juce::Label::textColourId, juce::Colours::grey);
+    }
+}
+
+//==============================================================================
+//  文本点击 → 通知宿主跳转播放位置
+//  使用 currentRegion->getTimeRange() 实时获取最新时间线位置
+//==============================================================================
+void TranscriptPluginEditor::syncTextToAudio(int charIndex)
+{
+    double wordTime = findTimeByCharIndex(charIndex);
+    if (wordTime < 0.0) return;
+
+    waveform.setPlayheadPosition(wordTime);
+
+    double absoluteHostTime = relativeToAbsolute(wordTime);
+
+    if (auto* editorView = getARAEditorView())
+    {
+        auto* dc = editorView->getDocumentController();
+        if (auto* playbackCtrl = dc->getHostPlaybackController())
+            playbackCtrl->requestSetPlaybackPosition(absoluteHostTime);
+    }
+}
+
+//==============================================================================
+//  进度条点击 → 高亮文本 + 驱动跳转
+//==============================================================================
+void TranscriptPluginEditor::syncAudioToText(double timeInSeconds)
+{
+    waveform.setPlayheadPosition(timeInSeconds);
+
+    lastHighlightedCharIndex = -1;
+    transcriptEditor.highlightByTime(timeInSeconds);
+
+    // 实时换算为宿主绝对时间线
+    double absoluteHostTime = relativeToAbsolute(timeInSeconds);
+    if (auto* editorView = getARAEditorView())
+    {
+        auto* dc = editorView->getDocumentController();
+        if (auto* playbackCtrl = dc->getHostPlaybackController())
+            playbackCtrl->requestSetPlaybackPosition(absoluteHostTime);
+    }
+}
+
+//==============================================================================
+double TranscriptPluginEditor::findTimeByCharIndex(int charIndex) const
+{
+    if (currentTimestamps == nullptr) return -1.0;
+
+    for (auto& ts : *currentTimestamps)
+    {
+        int end = ts.globalTextIndex + ts.character.length();
+        if (charIndex >= ts.globalTextIndex && charIndex < end)
+            return ts.startTime;
+    }
+    return -1.0;
+}
+
+//==============================================================================
+//  启动 ASR 识别
+//==============================================================================
+void TranscriptPluginEditor::startASR()
+{
+    auto* activeSrc = dataManager->getActiveSource();
+    if (activeSrc == nullptr)
+    {
+        asrStatusLabel.setText(juce::String::fromUTF8(
+            "\xe6\xb2\xa1\xe6\x9c\x89\xe9\x80\x89\xe4\xb8\xad\xe7\x9a\x84\xe9\x9f\xb3"
+            "\xe9\xa2\x91\xe7\x89\x87\xe6\xae\xb5"),
+                               juce::dontSendNotification);
+        return;
+    }
+
+    juce::File tempFile = juce::File::createTempFile(".wav");
+    {
+        std::unique_ptr<juce::ARAAudioSourceReader> reader(
+            new juce::ARAAudioSourceReader(activeSrc));
+
+        if (reader->sampleRate <= 0.0 || reader->lengthInSamples <= 0)
+        {
+            asrStatusLabel.setText(juce::String::fromUTF8(
+                "\xe6\x97\xa0\xe6\xb3\x95\xe8\xaf\xbb\xe5\x8f\x96\xe9\x9f\xb3\xe9\xa2"
+                "\x91\xe6\x95\xb0\xe6\x8d\xae"),
+                                   juce::dontSendNotification);
+            asrStatusLabel.setColour(juce::Label::textColourId, juce::Colours::orangered);
+            return;
+        }
+
+        auto outStream = std::make_unique<juce::FileOutputStream>(tempFile);
+        if (!outStream->openedOk())
+        {
+            asrStatusLabel.setText(juce::String::fromUTF8(
+                "\xe6\x97\xa0\xe6\xb3\x95\xe5\x88\x9b\xe5\xbb\xba\xe4\xb8\xb4\xe6\x97"
+                "\xb6\xe9\x9f\xb3\xe9\xa2\x91\xe6\x96\x87\xe4\xbb\xb6"),
+                                   juce::dontSendNotification);
+            return;
+        }
+
+        juce::WavAudioFormat wavFormat;
+        auto opts = juce::AudioFormatWriterOptions{}
+            .withSampleRate(reader->sampleRate)
+            .withNumChannels((int)reader->numChannels)
+            .withBitsPerSample(16);
+
+        std::unique_ptr<juce::OutputStream> streamPtr = std::move(outStream);
+        auto writer = wavFormat.createWriterFor(streamPtr, opts);
+        if (writer == nullptr)
+        {
+            asrStatusLabel.setText(juce::String::fromUTF8(
+                "\xe6\x97\xa0\xe6\xb3\x95\xe5\x86\x99\xe5\x85\xa5 WAV"),
+                                   juce::dontSendNotification);
+            return;
+        }
+
+        const int blockSize = 65536;
+        juce::AudioBuffer<float> tempBuf((int)reader->numChannels, blockSize);
+        juce::int64 samplesWritten = 0;
+        while (samplesWritten < reader->lengthInSamples)
+        {
+            int toRead = (int)juce::jmin((juce::int64)blockSize,
+                                          reader->lengthInSamples - samplesWritten);
+            reader->read(&tempBuf, 0, toRead, samplesWritten, true, true);
+            writer->writeFromAudioSampleBuffer(tempBuf, 0, toRead);
+            samplesWritten += toRead;
+        }
+        writer->flush();
+    }
+
+    static const std::pair<int, juce::String> models[] = {
+        {1, "Qwen/Qwen3-ASR-0.6B"},
+        {2, "openai/whisper-small"},
+        {3, "openai/whisper-medium"},
+        {4, "openai/whisper-large-v3"},
+    };
+    juce::String chosen = "Qwen/Qwen3-ASR-0.6B";
+    for (auto& m : models)
+    {
+        if (m.first == modelSelector.getSelectedId()) { chosen = m.second; break; }
+    }
+
+    asrProcessor.setModelName(chosen);
+    asrButton.setEnabled(false);
+    asrProgressValue = 0.0;
+    asrProgressBar.setVisible(true);
+    asrProgressBar.repaint();
+    asrStatusLabel.setText(juce::String::fromUTF8("ASR \xe8\xaf\x86\xe5\x88\xab\xe4\xb8\xad (")
+                           + chosen + ") ...",
+                           juce::dontSendNotification);
+    asrStatusLabel.setColour(juce::Label::textColourId, juce::Colours::yellow);
+
+    asrProcessor.start(tempFile);
+
+    tempAudioFile = tempFile;
+}

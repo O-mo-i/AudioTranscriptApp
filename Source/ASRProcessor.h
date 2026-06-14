@@ -50,6 +50,12 @@ public:
     /** 设置推理设备 */
     static void setDevice(const juce::String& device);
 
+    /** 设置 scripts 目录路径（包含 asr_worker.py 的文件夹）。
+     *  安装 VST3 后需要指向 scripts/ 所在的实际路径。
+     *  例如: ASRProcessor::setScriptsDirectory("C:/MyApp/scripts");
+     */
+    static void setScriptsDirectory(const juce::String& path);
+
 private:
     void run() override;
     void callError(const juce::String& msg);
@@ -60,6 +66,7 @@ private:
     static juce::String pythonPath;
     static juce::String modelName;
     static juce::String deviceName;
+    static juce::String scriptsDirectory;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ASRProcessor)
 };

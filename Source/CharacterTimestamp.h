@@ -7,4 +7,5 @@ struct CharacterTimestamp
     double startTime = 0.0;
     double endTime = 0.0;
     int globalTextIndex = 0;
+    bool isParagraphStart = false;
 };

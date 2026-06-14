@@ -1,5 +1,10 @@
-﻿#include "ASRProcessor.h"
+#include "ASRProcessor.h"
 #include <juce_events/juce_events.h>
+
+#if JUCE_WINDOWS
+ #define WIN32_LEAN_AND_MEAN
+ #include <windows.h>
+#endif
 
 // 文件日志辅助 — 同时写 DBG 和文件
 static void logToFile(const juce::String& msg)
@@ -11,9 +16,30 @@ static void logToFile(const juce::String& msg)
     logFile.appendText(msg + "\n", false, false);
 }
 
+// 获取 .vst3 插件 DLL 自身的路径（非宿主路径）
+// 用 VirtualQuery 获取本函数所在内存区域对应的模块基址，再转成文件路径
+#if JUCE_WINDOWS
+static juce::File getPluginDllPath()
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(&getPluginDllPath, &mbi, sizeof(mbi)) == 0)
+        return {};
+
+    auto hMod = static_cast<HMODULE>(mbi.AllocationBase);
+    WCHAR path[MAX_PATH + 1]{};
+    if (GetModuleFileNameW(hMod, path, MAX_PATH) == 0)
+        return {};
+
+    auto result = juce::File(path);
+    logToFile("[ASR] plugin DLL self path: " + result.getFullPathName());
+    return result;
+}
+#endif
+
 juce::String ASRProcessor::pythonPath;
-juce::String ASRProcessor::modelName  = "openai/whisper-small";
-juce::String ASRProcessor::deviceName = "cuda";
+juce::String ASRProcessor::modelName       = "openai/whisper-small";
+juce::String ASRProcessor::deviceName      = "cuda";
+juce::String ASRProcessor::scriptsDirectory;
 
 ASRProcessor::ASRProcessor()
     : juce::Thread("ASR Worker") {}
@@ -38,8 +64,6 @@ void ASRProcessor::cancel()
 }
 
 //==============================================================================
-//  工具函数（必须在 run() 之前定义）
-//==============================================================================
 void ASRProcessor::callError(const juce::String& msg)
 {
     isActive = false;
@@ -59,63 +83,75 @@ void ASRProcessor::run()
 {
     isActive = true;
 
-    // 定位 asr_worker.py — 从 .exe 所在目录向上追溯
-    juce::File projectDir = juce::File::getSpecialLocation(
-        juce::File::currentExecutableFile).getParentDirectory();
+    auto quote = [](const juce::String& s) { return "\"" + s + "\""; };
 
-    int depth = 0;
-    while (projectDir.exists() && !projectDir.getChildFile("scripts").isDirectory()
-           && depth < 5)
+    // ── 从 .vst3 插件 DLL 自身路径查找 scripts ─────────
+    // 目录结构：
+    //   VST3安装目录/
+    //     scripts/
+    //       asr_worker.py
+    //       .venv/Scripts/python.exe
+    //     Audio Transcript Editor.vst3/
+    //       Contents/x86_64-win/Audio Transcript Editor.vst3  ← DLL 自身
+    //
+    // getPluginDllPath() 返回 DLL 路径，即 .vst3 文件本身。
+    // 向上走两级（x86_64-win/ → Contents/ → .vst3/）得到 .vst3 目录，
+    // 再取父目录即 VST3 安装目录，scripts/ 同级放置。
+    // ──────────────────────────────────────────────────────────
+    juce::File vst3Dir;
+
+   #if JUCE_WINDOWS
+    auto dllFile = getPluginDllPath();
+    if (dllFile.exists())
     {
-        projectDir = projectDir.getParentDirectory();
-        depth++;
+        // DLL 在 x86_64-win/ 中 → 父目录 → 父目录 = .vst3 目录 → 父目录 = 安装目录
+        auto dllParent = dllFile.getParentDirectory();   // x86_64-win/
+        auto contentsDir = dllParent.getParentDirectory();   // Contents/
+        auto bundleDir   = contentsDir.getParentDirectory(); // .vst3/
+
+        if (bundleDir.getFileExtension().toLowerCase() == ".vst3")
+            vst3Dir = bundleDir.getParentDirectory();
+    }
+   #endif
+
+    // 开发回退：从构建目录的产物路径定位
+    if (vst3Dir == juce::File{})
+    {
+        auto exeDir = juce::File::getSpecialLocation(
+            juce::File::currentExecutableFile).getParentDirectory();
+        vst3Dir = exeDir.getParentDirectory().getParentDirectory();
     }
 
-    logToFile("[ASR] exe dir: "
-        + juce::File::getSpecialLocation(juce::File::currentExecutableFile).getFullPathName());
-    logToFile("[ASR] project dir candidate (depth=" + juce::String(depth) + "): "
-        + projectDir.getFullPathName());
+    logToFile("[ASR] vst3 base dir: " + vst3Dir.getFullPathName());
 
-    juce::File pythonScript = projectDir.getChildFile("scripts")
-                                  .getChildFile("asr_worker.py");
-    logToFile("[ASR] pythonScript path: " + pythonScript.getFullPathName()
-        + "  exists=" + (pythonScript.existsAsFile() ? "yes" : "no"));
+    juce::File scriptsDir = vst3Dir.getChildFile("scripts");
+    juce::File pythonExeFile = scriptsDir.getChildFile(".venv")
+                                        .getChildFile("Scripts")
+                                        .getChildFile("python.exe");
+    juce::File pythonScriptFile = scriptsDir.getChildFile("asr_worker.py");
 
-    if (!pythonScript.existsAsFile())
+    if (!pythonExeFile.existsAsFile())
     {
-        callError("Cannot find asr_worker.py");
+        callError("Python not found at: " + pythonExeFile.getFullPathName()
+                  + "\nPlease copy the 'scripts' folder next to the VST3 plugin.");
         return;
     }
 
-    // 构建命令行 — 优先使用项目虚拟环境中的 Python
-    auto quote = [](const juce::String& s) { return "\"" + s + "\""; };
-
-    juce::String py;
-    if (pythonPath.isNotEmpty())
+    if (!pythonScriptFile.existsAsFile())
     {
-        py = quote(pythonPath);
-    }
-    else
-    {
-        juce::File pythonExe = projectDir.getChildFile("scripts")
-                                   .getChildFile(".venv")
-                                   .getChildFile("Scripts")
-                                   .getChildFile("python.exe");
-        if (pythonExe.existsAsFile())
-        {
-            py = quote(pythonExe.getFullPathName());
-            logToFile("[ASR] using venv python: " + pythonExe.getFullPathName());
-        }
-        else
-        {
-            py = "python";  // 回退到系统 PATH
-            logToFile("[ASR] venv python not found, fallback to system python");
-        }
+        callError("Script not found at: " + pythonScriptFile.getFullPathName()
+                  + "\nPlease copy the 'scripts' folder next to the VST3 plugin.");
+        return;
     }
 
+    logToFile("[ASR] python: " + pythonExeFile.getFullPathName());
+    logToFile("[ASR] script: " + pythonScriptFile.getFullPathName());
+    logToFile("[ASR] audio : " + audioFile.getFullPathName());
+
+    // 构建命令行
     juce::String cmd;
-    cmd << py
-        << " " << quote(pythonScript.getFullPathName())
+    cmd << quote(pythonExeFile.getFullPathName())
+        << " " << quote(pythonScriptFile.getFullPathName())
         << " --audio " << quote(audioFile.getFullPathName())
         << " --device " << deviceName
         << " --model " << modelName;
@@ -141,7 +177,6 @@ void ASRProcessor::run()
         {
             lineBuf.append(readBuf, n);
 
-            // 从缓冲区逐行提取
             auto* data = static_cast<const char*>(lineBuf.getData());
             auto size = lineBuf.getSize();
             int start = 0;
@@ -176,7 +211,6 @@ void ASRProcessor::run()
                 }
             }
 
-            // 保留未完成行
             auto remaining = size - start;
             if (remaining > 0 && start > 0)
                 memmove(lineBuf.getData(), data + start, remaining);
@@ -184,7 +218,7 @@ void ASRProcessor::run()
         }
         else
         {
-            wait(50);  // 无数据时短暂休眠
+            wait(50);
         }
     }
 
@@ -242,7 +276,6 @@ void ASRProcessor::run()
     juce::String fullText;
     auto* arr = wordsVar.getArray();
 
-    // Track whether we've already emitted the very first paragraph
     bool isFirstParagraph = true;
 
     for (int i = 0; i < arr->size(); ++i)
@@ -258,18 +291,32 @@ void ASRProcessor::run()
             fullText += juce::String::formatted("%02d:%02d ",
                 (int)(t / 60.0), ((int)t) % 60);
         }
-        isFirstParagraph = false; // reset after first word (which always has the flag)
+        isFirstParagraph = false;
 
         CharacterTimestamp ts;
-        ts.character       = item["word"].toString();
-        ts.startTime       = (double)item["start"];
-        ts.endTime         = (double)item["end"];
-        ts.globalTextIndex = fullText.length();
+        ts.character          = item["word"].toString();
+        ts.startTime          = (double)item["start"];
+        ts.endTime            = (double)item["end"];
+        ts.globalTextIndex    = fullText.length();
+        ts.isParagraphStart   = isParagraphStart;
         fullText += ts.character;
         timestamps.push_back(ts);
     }
 
     isActive = false;
+
+    // === 诊断：校验 C++ 实际收到的字符数 ===
+    logToFile("====== [ASR DATA CHECK] ======");
+    logToFile("Total characters parsed in C++: " + juce::String((int)timestamps.size()));
+    if (!timestamps.empty())
+    {
+        logToFile("First char startTime: " + juce::String(timestamps.front().startTime));
+        logToFile("Last char startTime:  " + juce::String(timestamps.back().startTime));
+        logToFile("First char text: \"" + timestamps.front().character + "\"");
+        logToFile("Last char text:  \"" + timestamps.back().character + "\"");
+    }
+    logToFile("jsonLine length:   " + juce::String((int)jsonLine.length()) + " chars");
+    logToFile("================================");
 
     // 回调到主线程
     if (onResult && !threadShouldExit())
@@ -282,6 +329,7 @@ void ASRProcessor::run()
 }
 
 //==============================================================================
-void ASRProcessor::setPythonPath(const juce::String& path) { pythonPath = path; }
-void ASRProcessor::setModelName(const juce::String& m)     { modelName  = m; }
-void ASRProcessor::setDevice(const juce::String& d)        { deviceName = d; }
+void ASRProcessor::setPythonPath(const juce::String& path)      { pythonPath = path; }
+void ASRProcessor::setModelName(const juce::String& m)         { modelName  = m; }
+void ASRProcessor::setDevice(const juce::String& d)            { deviceName = d; }
+void ASRProcessor::setScriptsDirectory(const juce::String& p)  { scriptsDirectory = p; }

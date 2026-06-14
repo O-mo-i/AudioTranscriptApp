@@ -1,37 +1,33 @@
-﻿#pragma once
-#include <juce_audio_utils/juce_audio_utils.h>
+#pragma once
+#include <juce_audio_processors/juce_audio_processors.h>
 #include <functional>
 
-class WaveformComponent : public juce::Component,
-                          private juce::ChangeListener,
-                          private juce::Timer
+/**
+ * 细长播放进度条（取代大波形）。
+ *
+ * 只在顶部占用 8px 高度，用深色背景 + 亮色已播放段 + 红色三角指针
+ * 显示当前播放进度。点击可在对应位置跳转。
+ */
+class WaveformComponent : public juce::Component
 {
 public:
-    WaveformComponent(juce::AudioTransportSource& transport);
+    WaveformComponent();
     ~WaveformComponent() override;
 
     void paint(juce::Graphics& g) override;
-    void resized() override;
     void mouseDown(const juce::MouseEvent& event) override;
 
-    void setPlayheadPosition(double timeInSeconds);
-    double getPlayheadPosition() const noexcept { return playheadPosition; }
+    /** 设置音频源（仅用于获取总时长） */
+    void setAudioSource(juce::ARAAudioSource* source);
 
-    // 接收外部传入的时长，与 MainComponent 保持一致
-    void loadAudioFile(const juce::File& file, double lengthInSeconds);
+    /** 外部驱动播放头位置（来自 PlayHeadState 轮询） */
+    void setPlayheadPosition(double timeInSeconds);
+
     double getTotalLength() const noexcept { return totalLength; }
 
     std::function<void(double timeInSeconds)> onTimeSelected;
 
 private:
-    void changeListenerCallback(juce::ChangeBroadcaster* source) override;
-    void timerCallback() override;
-
-    juce::AudioFormatManager formatManager;
-    juce::AudioThumbnailCache thumbnailCache{ 5 };
-    juce::AudioThumbnail thumbnail;
-    juce::AudioTransportSource& transportSource;
-
     double playheadPosition = 0.0;
     double totalLength = 0.0;
 
