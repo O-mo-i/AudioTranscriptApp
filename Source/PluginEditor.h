@@ -97,6 +97,7 @@ private:
     juce::TextButton asrButton;
     juce::Label asrStatusLabel;
     juce::ProgressBar asrProgressBar;
+    juce::ToggleButton offlineModeToggle;
     double asrProgressValue{ 0.0 };
 
     // ASR 引擎

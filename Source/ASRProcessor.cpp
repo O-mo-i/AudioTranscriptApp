@@ -40,6 +40,8 @@ juce::String ASRProcessor::pythonPath;
 juce::String ASRProcessor::modelName       = "openai/whisper-small";
 juce::String ASRProcessor::deviceName      = "cuda";
 juce::String ASRProcessor::scriptsDirectory;
+bool ASRProcessor::offlineMode  = true;    // 默认离线模式
+juce::String ASRProcessor::modelDirectory;
 
 ASRProcessor::ASRProcessor()
     : juce::Thread("ASR Worker") {}
@@ -154,7 +156,19 @@ void ASRProcessor::run()
         << " " << quote(pythonScriptFile.getFullPathName())
         << " --audio " << quote(audioFile.getFullPathName())
         << " --device " << deviceName
-        << " --model " << modelName;
+        << " --model " << quote(modelName);
+
+    // 离线模式
+    if (offlineMode)
+        cmd << " --offline";
+
+    // 本地模型目录
+    if (modelDirectory.isNotEmpty())
+        cmd << " --model-dir " << quote(modelDirectory);
+
+    logToFile(juce::String("[ASR] offline: ") + (offlineMode ? "yes" : "no"));
+    if (modelDirectory.isNotEmpty())
+        logToFile("[ASR] model-dir: " + modelDirectory);
 
     logToFile("[ASR] cmd: " + cmd);
 
@@ -333,3 +347,5 @@ void ASRProcessor::setPythonPath(const juce::String& path)      { pythonPath = p
 void ASRProcessor::setModelName(const juce::String& m)         { modelName  = m; }
 void ASRProcessor::setDevice(const juce::String& d)            { deviceName = d; }
 void ASRProcessor::setScriptsDirectory(const juce::String& p)  { scriptsDirectory = p; }
+void ASRProcessor::setOfflineMode(bool offline)                { offlineMode = offline; }
+void ASRProcessor::setModelDirectory(const juce::String& p)    { modelDirectory = p; }

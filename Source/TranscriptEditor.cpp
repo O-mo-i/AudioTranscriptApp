@@ -13,7 +13,7 @@ TranscriptEditor::TranscriptEditor()
     setColour(juce::TextEditor::highlightColourId, juce::Colour(0x804a4a8e));
     setColour(juce::TextEditor::focusedOutlineColourId, juce::Colour(0xFF4a4a8e));
 
-    setIndents(10, 10);
+    setIndents(70, 10);  // 左侧留出时间戳空间
 
     startTimer(100);
 }
@@ -27,6 +27,21 @@ void TranscriptEditor::setTimestamps(const std::vector<CharacterTimestamp>* time
 {
     timestamps = timestampsPtr;
     lastHighlightedIndex = -1;
+}
+
+void TranscriptEditor::setParagraphTimestamps(const std::vector<ParagraphTimestamp>& pts)
+{
+    paragraphTimestamps = pts;
+    repaint();
+}
+
+void TranscriptEditor::setTimeOffset(double offset)
+{
+    if (std::abs(offset - timeOffset) > 0.001)
+    {
+        timeOffset = offset;
+        repaint();
+    }
 }
 
 //==============================================================================
@@ -91,6 +106,36 @@ void TranscriptEditor::highlightByTime(double timeInSeconds)
 int TranscriptEditor::getCaretCharIndex() const
 {
     return getCaretPosition();
+}
+
+void TranscriptEditor::paint(juce::Graphics& g)
+{
+    // 先让 TextEditor 绘制文本
+    juce::TextEditor::paint(g);
+
+    // 再在左侧绘制段落时间戳
+    if (paragraphTimestamps.empty())
+        return;
+
+    g.setFont(juce::Font("Microsoft YaHei", 14.0f, juce::Font::plain));
+    g.setColour(juce::Colour(0xFF888888));
+
+    for (const auto& pt : paragraphTimestamps)
+    {
+        auto charBounds = getCaretRectangleForCharIndex(pt.firstCharIndex);
+        if (charBounds.isEmpty())
+            continue;
+
+        auto globalTime = pt.timeSeconds + timeOffset;
+        auto timeStr = juce::String::formatted("%02d:%02d",
+            (int)(globalTime / 60.0), ((int)globalTime) % 60);
+
+        // 在段落首字左侧绘制时间戳，垂直居中
+        g.drawFittedText(timeStr,
+            charBounds.getX() - 62, charBounds.getY(),
+            56, charBounds.getHeight(),
+            juce::Justification::centredRight, 1);
+    }
 }
 
 void TranscriptEditor::timerCallback()

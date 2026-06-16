@@ -56,6 +56,24 @@ public:
      */
     static void setScriptsDirectory(const juce::String& path);
 
+    //── 离线模式 ──────────────────────────────
+    /** 设置离线模式。离线模式下禁止所有网络请求，仅从本地缓存加载模型。
+     *  默认为 true（离线模式）。如果模型不在本地缓存中会给出清晰提示。
+     */
+    static void setOfflineMode(bool offline);
+
+    /** 获取当前是否处于离线模式 */
+    static bool isOfflineMode() noexcept { return offlineMode; }
+
+    /** 设置本地模型目录路径（离线模式下从此路径加载模型）。
+     *  例如: ASRProcessor::setModelDirectory("C:/Models/Qwen3-ASR");
+     *  如果不设置，离线模式会从 HuggingFace 缓存目录加载。
+     */
+    static void setModelDirectory(const juce::String& path);
+
+    /** 获取本地模型目录路径 */
+    static juce::String getModelDirectory() noexcept { return modelDirectory; }
+
 private:
     void run() override;
     void callError(const juce::String& msg);
@@ -67,6 +85,8 @@ private:
     static juce::String modelName;
     static juce::String deviceName;
     static juce::String scriptsDirectory;
+    static bool offlineMode;
+    static juce::String modelDirectory;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ASRProcessor)
 };

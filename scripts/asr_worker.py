@@ -207,7 +207,29 @@ def run_asr_qwen(audio_path: str, device: str, model_name: str) -> dict:
 
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     device_map = device if torch.cuda.is_available() else "cpu"
-    forced_aligner_model = model_name.replace("ASR", "ForcedAligner")
+
+    # 离线/本地路径模式：forced_aligner 需要单独指定
+    is_offline = os.environ.get("TRANSFORMERS_OFFLINE") == "1"
+    is_local_path = os.path.sep in model_name or os.path.isdir(model_name)
+    forced_aligner_model = None
+    if is_local_path or is_offline:
+        # 本地路径模式：不自动替换名称，让用户通过 --model-dir 统一管理
+        # 或从原始 HuggingFace 名称推导
+        hf_name = model_name
+        if is_local_path:
+            # 从路径反推 HuggingFace 名称
+            base = os.path.basename(model_name)
+            if base.startswith("models--"):
+                # snapshot 下载目录格式
+                parts = base.replace("models--", "").split("--")
+                if len(parts) >= 2:
+                    hf_name = "/".join(parts)
+            else:
+                hf_name = base
+        forced_aligner_model = hf_name.replace("ASR", "ForcedAligner")
+        log(f"离线模式 forced_aligner: {forced_aligner_model}")
+    else:
+        forced_aligner_model = model_name.replace("ASR", "ForcedAligner")
 
     # 获取音频时长
     info = sf.info(audio_path)
@@ -217,14 +239,38 @@ def run_asr_qwen(audio_path: str, device: str, model_name: str) -> dict:
     # 加载模型（只加载一次）
     log(f"加载模型: {model_name} device={device}")
     t0 = time.time()
-    model = Qwen3ASRModel.from_pretrained(
-        model_name,
-        dtype=dtype,
-        device_map=device_map,
-        forced_aligner=forced_aligner_model,
-        forced_aligner_kwargs={"dtype": dtype, "device_map": device_map},
-        max_new_tokens=256,
-    )
+    is_offline_mode = bool(os.environ.get("TRANSFORMERS_OFFLINE"))
+    forced_aligner_kwargs = {"dtype": dtype, "device_map": device_map}
+    if is_offline_mode:
+        forced_aligner_kwargs["local_files_only"] = True
+
+    try:
+        model = Qwen3ASRModel.from_pretrained(
+            model_name,
+            dtype=dtype,
+            device_map=device_map,
+            forced_aligner=forced_aligner_model,
+            forced_aligner_kwargs=forced_aligner_kwargs,
+            max_new_tokens=256,
+            local_files_only=is_offline_mode,
+        )
+    except OSError as e:
+        err_msg = str(e)
+        if "Offline mode" in err_msg or "connect" in err_msg.lower():
+            raise RuntimeError(
+                f"模型 {model_name} 不在本地缓存中。\n"
+                f"请先在线运行一次 ASR 以下载模型，或使用 --model-dir 指定本地路径。\n"
+                f"错误详情: {err_msg}"
+            )
+        raise
+    except Exception as e:
+        if "Connection" in str(e) or "Timeout" in str(e) or "timeout" in str(e):
+            raise RuntimeError(
+                f"连接 HuggingFace 服务器超时，无法加载模型 {model_name}。\n"
+                f"请切换到离线模式或在有网络的環境下先运行一次。\n"
+                f"错误详情: {e}"
+            )
+        raise
     log(f"模型加载完成 ({time.time() - t0:.1f}s)")
     progress(5)
 
@@ -329,12 +375,30 @@ def run_asr_whisper(audio_path: str, device: str, model_name: str) -> dict:
 
     log(f"加载模型: {model_name} device={device}")
     t0 = time.time()
-    asr = pipeline(
-        "automatic-speech-recognition",
-        model=model_name,
-        device=device,
-        chunk_length_s=30,
-    )
+    try:
+        asr = pipeline(
+            "automatic-speech-recognition",
+            model=model_name,
+            device=device,
+            chunk_length_s=30,
+        )
+    except OSError as e:
+        err_msg = str(e)
+        if "Offline mode" in err_msg or "connect" in err_msg.lower():
+            raise RuntimeError(
+                f"模型 {model_name} 不在本地缓存中。\n"
+                f"请先在线运行一次 ASR 以下载模型，或使用 --model-dir 指定本地路径。\n"
+                f"错误详情: {err_msg}"
+            )
+        raise
+    except Exception as e:
+        if "Connection" in str(e) or "Timeout" in str(e) or "timeout" in str(e):
+            raise RuntimeError(
+                f"连接 HuggingFace 服务器超时，无法加载模型 {model_name}。\n"
+                f"请切换到离线模式或在有网络的环境下先运行一次。\n"
+                f"错误详情: {e}"
+            )
+        raise
     log(f"模型加载完成 ({time.time() - t0:.1f}s)")
     progress(20)
 
@@ -407,20 +471,88 @@ def run_asr(audio_path: str, device: str, model_name: str) -> dict:
         return run_asr_whisper(audio_path, device, model_name)
 
 
+def resolve_model_path(model_name: str, model_dir: str | None) -> str:
+    """解析模型路径。如果指定了 model_dir，优先使用本地路径。"""
+    if model_dir:
+        # 直接使用本地目录
+        local_path = os.path.join(model_dir, os.path.basename(model_name))
+        if os.path.isdir(local_path):
+            log(f"使用本地模型: {local_path}")
+            return local_path
+        if os.path.isdir(model_dir):
+            log(f"使用本地模型目录: {model_dir}")
+            return model_dir
+        log(f"警告: 本地模型目录不存在 ({model_dir})，回退到 HuggingFace 名称")
+    return model_name
+
+
 def main():
     parser = argparse.ArgumentParser(description="ASR 语音识别字级时间戳")
     parser.add_argument("--audio", required=True, help="音频文件路径 (wav/mp3/flac)")
     parser.add_argument("--device", default="cuda", help="推理设备: cuda / cpu (默认 cuda)")
     parser.add_argument("--model", default="Qwen/Qwen3-ASR-0.6B",
                         help="HuggingFace 模型名 (默认 Qwen/Qwen3-ASR-0.6B)")
+    parser.add_argument("--offline", action="store_true",
+                        help="离线模式：禁止所有网络请求，仅从本地缓存加载模型")
+    parser.add_argument("--model-dir", default=None,
+                        help="本地模型目录路径（离线模式下从此路径加载模型，不联网下载）")
     args = parser.parse_args()
+
+    # ── 离线模式设置 ──────────────────────────
+    if args.offline:
+        log("离线模式已启用，禁止所有网络请求")
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["HF_OFFLINE"] = "1"
+        # 禁用 huggingface_hub 的 telemetry 和版本检查
+        os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+        os.environ["HUGGINGFACE_HUB_DISABLE_TELEMETRY"] = "1"
+        os.environ["DISABLE_VERSION_CHECK"] = "1"
+        # 设置较短超时，防止 socket 阻塞
+        os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "5"
+        os.environ["HF_HUB_ETAG_TIMEOUT"] = "5"
+
+    # 解析模型路径（支持本地目录）
+    resolved_model = resolve_model_path(args.model, args.model_dir)
+    log(f"模型路径: {resolved_model}")
 
     if not os.path.isfile(args.audio):
         print(json.dumps({"success": False, "error": f"文件不存在: {args.audio}"}),
               file=sys.stderr)
         sys.exit(1)
 
+    # 离线模式预检：检查模型是否在本地缓存中
+    if args.offline and not args.model_dir:
+        import importlib.util
+        # 检查 huggingface_hub 缓存
+        hf_hub_available = importlib.util.find_spec("huggingface_hub") is not None
+        if hf_hub_available:
+            try:
+                from huggingface_hub import try_to_load_from_cache
+                # 检查模型配置文件是否在缓存中
+                cached = try_to_load_from_cache(args.model, "config.json")
+                if cached is None or cached is False:
+                    log(f"离线模式：模型 {args.model} 不在本地缓存中")
+                    log(f"请先在线运行一次 ASR 下载模型，或使用 --model-dir 指定本地路径")
+                    log(f"也可以临时关闭离线模式（在插件设置中取消勾选）")
+                    # 不退出，给 from_pretrained 一个机会用缓存
+                    # 如果还是失败，transformers 会抛出 OSError
+            except Exception:
+                pass
+
+    # 预检 torch CUDA
+    if args.device == "cuda":
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                log("CUDA 不可用，将自动降级到 CPU")
+                args.device = "cpu"
+        except ImportError:
+            pass
+
     try:
+        # 用已解析的模型路径覆盖
+        args.model = resolved_model
         result = run_asr(args.audio, args.device, args.model)
 
         # 诊断落盘

@@ -110,6 +110,21 @@ TranscriptPluginEditor::TranscriptPluginEditor(TranscriptPluginProcessor& p)
     asrButton.setEnabled(false);
     addAndMakeVisible(asrButton);
 
+    // 离线模式开关
+    offlineModeToggle.setButtonText(juce::String::fromUTF8(
+        "\xe7\xa6\xbb\xe7\xba\xbf\xe6\xa8\xa1\xe5\xbc\x8f"));
+    offlineModeToggle.setTooltip(juce::String::fromUTF8(
+        "\xe5\x90\xaf\xe7\x94\xa8\xe5\x90\x8e\xe4\xbb\x85\xe4\xbb\x8e\xe6\x9c\xac\xe5\x9c\xb0"
+        "\xe7\xbc\x93\xe5\xad\x98\xe5\x8a\xa0\xe8\xbd\xbd\xe6\xa8\xa1\xe5\x9e\x8b\xef\xbc\x8c"
+        "\xe4\xb8\x8d\xe8\xbf\x9e\xe7\xbd\x91\xe4\xb8\x8b\xe8\xbd\xbd"));
+    offlineModeToggle.setToggleState(ASRProcessor::isOfflineMode(), juce::dontSendNotification);
+    offlineModeToggle.onStateChange = [this]()
+    {
+        bool offline = offlineModeToggle.getToggleState();
+        ASRProcessor::setOfflineMode(offline);
+    };
+    addAndMakeVisible(offlineModeToggle);
+
     asrStatusLabel.setText(juce::String::fromUTF8("\xe5\x9c\xa8 Studio One \xe4\xb8\xad\xe9\x80\x89\xe4\xb8\xad\xe9\x9f\xb3\xe9\xa2\x91\xe7\x89\x87\xe6\xae\xb5\xe5\x90\x8e\xe5\x8f\xaf\xe8\xbf\x9b\xe8\xa1\x8c ASR \xe8\xaf\x86\xe5\x88\xab"),
                            juce::dontSendNotification);
     asrStatusLabel.setColour(juce::Label::textColourId, juce::Colours::grey);
@@ -246,10 +261,12 @@ void TranscriptPluginEditor::resized()
 
     asrProgressBar.setBounds(getWidth() - 350, 5, 340, 14);
 
-    const int btnW = 100;
+    const int btnW = 70;
     const int comboW = 220;
+    const int toggleW = 90;
     const int gap = 4;
 
+    offlineModeToggle.setBounds(controlArea.removeFromLeft(toggleW).reduced(gap));
     modelSelector.setBounds(controlArea.removeFromLeft(comboW).reduced(gap));
     asrButton.setBounds(controlArea.removeFromLeft(btnW).reduced(gap));
 }
@@ -267,6 +284,12 @@ void TranscriptPluginEditor::timerCallback()
     double sourceRelTime = juce::jmax(0.0, absoluteToSourceTime(absPos));
 
     waveform.setPlayheadPosition(sourceRelTime);
+
+    //── 实时更新段落时间戳偏移量（适配音频块拖动、剪切） ──
+    {
+        double offset = (currentRegion != nullptr) ? (getRegionPlaybackStart() - getViewStart()) : 0.0;
+        transcriptEditor.setTimeOffset(offset);
+    }
 
     //── 定时轮询当前 ARA 选区（兜底跨轨断链） ──
     if (++selectionPollCounter >= 15)  // 每隔 ~500ms 检查一次
@@ -379,6 +402,7 @@ void TranscriptPluginEditor::onActiveSourceChanged(juce::ARAAudioSource* source)
         waveform.setAudioSource(nullptr);
         transcriptEditor.clear();
         transcriptEditor.setTimestamps(nullptr);
+        transcriptEditor.setParagraphTimestamps({});
         currentTimestamps = nullptr;
         asrButton.setEnabled(false);
         asrStatusLabel.setText(juce::String::fromUTF8(
@@ -405,6 +429,9 @@ void TranscriptPluginEditor::onActiveSourceChanged(juce::ARAAudioSource* source)
         filteredTimestamps.clear();
         filteredFullText.clear();
 
+        std::vector<TranscriptEditor::ParagraphTimestamp> paragraphTimestamps;
+        bool isFirstParagraph = true;
+
         for (size_t i = 0; i < data->timestamps.size(); ++i)
         {
             const auto& ts = data->timestamps[i];
@@ -412,24 +439,30 @@ void TranscriptPluginEditor::onActiveSourceChanged(juce::ARAAudioSource* source)
             // 只通过时间戳判断是否在当前切片视口内
             if (ts.startTime >= viewRange.getStart() && ts.startTime < viewRange.getEnd())
             {
-                // 段落首字：补换行 + MM:SS 时间标签
-                if (ts.isParagraphStart && !filteredFullText.isEmpty())
-                {
+                // 段落首字：补换行（时间戳不加入文本内容）
+                if (ts.isParagraphStart && !isFirstParagraph)
                     filteredFullText += "\n";
-                    int totalSec = juce::roundToInt(ts.startTime);
-                    filteredFullText += juce::String::formatted("%02d:%02d ",
-                        totalSec / 60, totalSec % 60);
-                }
 
                 auto adjusted = ts;
                 adjusted.globalTextIndex = filteredFullText.length();
                 filteredFullText += ts.character;
                 filteredTimestamps.push_back(adjusted);
+
+                // 记录段落时间戳（单独存储，不参与文本内容）
+                // 视口首字（可能是剪切产生的断点）总是显示时间戳
+                if (paragraphTimestamps.empty())
+                    paragraphTimestamps.push_back({adjusted.globalTextIndex, ts.startTime});
+                else if (ts.isParagraphStart)
+                    paragraphTimestamps.push_back({adjusted.globalTextIndex, ts.startTime});
+
+                isFirstParagraph = false;
             }
         }
 
         transcriptEditor.setText(filteredFullText, juce::dontSendNotification);
         transcriptEditor.setTimestamps(&filteredTimestamps);
+        transcriptEditor.setParagraphTimestamps(paragraphTimestamps);
+        transcriptEditor.setTimeOffset(getRegionPlaybackStart() - getViewStart());
         currentTimestamps = &filteredTimestamps;
         asrButton.setEnabled(true);
         asrStatusLabel.setText(juce::String::fromUTF8("ASR \xe5\xb7\xb2\xe5\xae\x8c\xe6\x88\x90"),
