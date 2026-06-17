@@ -334,12 +334,8 @@ void TranscriptPluginEditor::pollSelectionChanged()
         if (regions.empty())
             return;
 
-        auto* region = regions.front();
-        auto* audioMod = region->getAudioModification<juce::ARAAudioModification>();
-        auto* audioSource = audioMod->getAudioSource();
-
-        // 与当前 activeSource 对比，不一样则触发切换
-        if (audioSource != nullptr && audioSource != dataManager->getActiveSource())
+        // 指针变化即代表选区已变化（同轨切换或跨轨均适用）
+        if (regions.front() != currentRegion)
             onNewSelection(selection);
     }
 }
@@ -368,20 +364,37 @@ void TranscriptPluginEditor::onNewSelection(const juce::ARAViewSelection& select
     if (regions.empty())
         return;
 
-    // 解除旧区域的监听
+    auto* newRegion = regions.front();
+    auto* newSequence = newRegion->getRegionSequence<juce::ARARegionSequence>();
+    auto* newAudioMod = newRegion->getAudioModification<juce::ARAAudioModification>();
+    auto* newAudioSrc = newAudioMod->getAudioSource();
+
+    //── 情况 1：同一条轨道的区域切换 → 仅换 region 监听和波形，不刷文本 ──
+    if (newSequence != nullptr && newSequence == currentRegionSequence)
+    {
+        if (currentRegion)
+            currentRegion->removeListener(this);
+
+        currentRegion = newRegion;
+        currentRegion->addListener(this);
+
+        // 仅更新波形（适配新音频块的相对总长度），绝对不动文本
+        if (newAudioSrc != nullptr)
+            waveform.setAudioSource(newAudioSrc);
+
+        return;  // ← 直接静默退出，文本框丝滑静止，无任何 repaint
+    }
+
+    //── 情况 2：真正跨轨 → 执行全量切换 ──
     if (currentRegion)
         currentRegion->removeListener(this);
 
-    currentRegion = regions.front();
-    currentRegionSequence = currentRegion->getRegionSequence<juce::ARARegionSequence>();
-    auto* audioMod = currentRegion->getAudioModification<juce::ARAAudioModification>();
-    auto* audioSource = audioMod->getAudioSource();
-
-    // 监听新区域的属性变化（用户拖动时更新时轴偏移）
+    currentRegion = newRegion;
+    currentRegionSequence = newSequence;
     currentRegion->addListener(this);
 
-    if (audioSource != nullptr)
-        dataManager->setActiveSource(audioSource);
+    if (newAudioSrc != nullptr)
+        dataManager->setActiveSource(newAudioSrc);
 }
 
 //==============================================================================
