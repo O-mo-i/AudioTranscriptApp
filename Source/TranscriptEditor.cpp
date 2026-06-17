@@ -14,14 +14,9 @@ TranscriptEditor::TranscriptEditor()
     setColour(juce::TextEditor::focusedOutlineColourId, juce::Colour(0xFF4a4a8e));
 
     setIndents(70, 10);  // 左侧留出时间戳空间
-
-    startTimer(100);
 }
 
-TranscriptEditor::~TranscriptEditor()
-{
-    stopTimer();
-}
+TranscriptEditor::~TranscriptEditor() = default;
 
 void TranscriptEditor::setTimestamps(const std::vector<CharacterTimestamp>* timestampsPtr)
 {
@@ -32,6 +27,7 @@ void TranscriptEditor::setTimestamps(const std::vector<CharacterTimestamp>* time
 void TranscriptEditor::setParagraphTimestamps(const std::vector<ParagraphTimestamp>& pts)
 {
     paragraphTimestamps = pts;
+    rebuildTimestampCache();
     repaint();
 }
 
@@ -40,6 +36,7 @@ void TranscriptEditor::setTimeOffset(double offset)
     if (std::abs(offset - timeOffset) > 0.001)
     {
         timeOffset = offset;
+        rebuildTimestampCache();
         repaint();
     }
 }
@@ -79,8 +76,6 @@ void TranscriptEditor::highlightByTime(double timeInSeconds)
                 }
             }
 
-            programmaticChange = true;
-
             if (crossedLine)
             {
                 // 跨行/跨段 → 允许自动滚动
@@ -96,8 +91,6 @@ void TranscriptEditor::highlightByTime(double timeInSeconds)
             }
 
             lastHighlightedIndex = startIdx;
-            lastKnownCaretPos = getCaretCharIndex();
-            programmaticChange = false;
             return;
         }
     }
@@ -113,42 +106,23 @@ void TranscriptEditor::paint(juce::Graphics& g)
     // 先让 TextEditor 绘制文本
     juce::TextEditor::paint(g);
 
-    // 再在左侧绘制段落时间戳
-    if (paragraphTimestamps.empty())
+    // 再在左侧绘制段落时间戳（使用缓存，不调用 getCaretRectangleForCharIndex）
+    if (timestampDisplayCache.empty())
         return;
 
     g.setFont(juce::Font("Microsoft YaHei", 14.0f, juce::Font::plain));
     g.setColour(juce::Colour(0xFF888888));
 
-    for (const auto& pt : paragraphTimestamps)
+    for (const auto& cached : timestampDisplayCache)
     {
-        auto charBounds = getCaretRectangleForCharIndex(pt.firstCharIndex);
-        if (charBounds.isEmpty())
+        if (cached.charBounds.isEmpty())
             continue;
 
-        auto globalTime = pt.timeSeconds + timeOffset;
-        auto timeStr = juce::String::formatted("%02d:%02d",
-            (int)(globalTime / 60.0), ((int)globalTime) % 60);
-
         // 在段落首字左侧绘制时间戳，垂直居中
-        g.drawFittedText(timeStr,
-            charBounds.getX() - 62, charBounds.getY(),
-            56, charBounds.getHeight(),
+        g.drawFittedText(cached.timeStr,
+            cached.charBounds.getX() - 62, cached.charBounds.getY(),
+            56, cached.charBounds.getHeight(),
             juce::Justification::centredRight, 1);
-    }
-}
-
-void TranscriptEditor::timerCallback()
-{
-    if (programmaticChange)
-        return;
-
-    int currentPos = getCaretCharIndex();
-    if (currentPos != lastKnownCaretPos)
-    {
-        lastKnownCaretPos = currentPos;
-        if (onCaretMoved)
-            onCaretMoved(currentPos);
     }
 }
 
@@ -162,4 +136,62 @@ bool TranscriptEditor::keyPressed(const juce::KeyPress& key)
     }
 
     return juce::TextEditor::keyPressed(key);
+}
+
+//==============================================================================
+//  鼠标事件：仅当用户真实点击导致光标变化时触发 onCaretMoved
+//  避免 setText 等程序性操作引发光标归零导致的错误同步
+//==============================================================================
+void TranscriptEditor::mouseDown(const juce::MouseEvent& event)
+{
+    caretPosBeforeMouseDown = getCaretPosition();
+    juce::TextEditor::mouseDown(event);
+}
+
+void TranscriptEditor::mouseUp(const juce::MouseEvent& event)
+{
+    juce::TextEditor::mouseUp(event);
+
+    int newPos = getCaretPosition();
+    if (newPos != caretPosBeforeMouseDown)
+    {
+        if (onCaretMoved)
+            onCaretMoved(newPos);
+    }
+}
+
+//==============================================================================
+//  视口变化：重新缓存可见段落的时间戳屏幕位置
+//==============================================================================
+void TranscriptEditor::mouseWheelMove(const juce::MouseEvent& event, const juce::MouseWheelDetails& wheel)
+{
+    juce::TextEditor::mouseWheelMove(event, wheel);
+    rebuildTimestampCache();
+}
+
+void TranscriptEditor::resized()
+{
+    juce::TextEditor::resized();
+    rebuildTimestampCache();
+}
+
+//==============================================================================
+//  重建时间戳显示缓存
+//  一次性计算所有段落时间戳的屏幕坐标，避免 paint 中重复计算
+//==============================================================================
+void TranscriptEditor::rebuildTimestampCache()
+{
+    timestampDisplayCache.clear();
+    timestampDisplayCache.reserve(paragraphTimestamps.size());
+
+    for (const auto& pt : paragraphTimestamps)
+    {
+        auto charBounds = getCaretRectangleForCharIndex(pt.firstCharIndex);
+
+        auto globalTime = pt.timeSeconds + timeOffset;
+        auto timeStr = juce::String::formatted("%02d:%02d",
+            (int)(globalTime / 60.0), ((int)globalTime) % 60);
+
+        timestampDisplayCache.push_back({charBounds, timeStr});
+    }
 }

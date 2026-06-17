@@ -401,6 +401,28 @@ void TranscriptPluginEditor::willUpdatePlaybackRegionProperties(
 }
 
 //==============================================================================
+//  ARA 播放区域即将销毁 —— 剪切/删除音频块时安全清除引用，防止死锁与崩溃
+//==============================================================================
+void TranscriptPluginEditor::willDestroyPlaybackRegion(juce::ARAPlaybackRegion* region)
+{
+    if (region == currentRegion)
+    {
+        currentRegion->removeListener(this);
+        currentRegion = nullptr;
+
+        // 安全清空相关 UI 状态
+        transcriptEditor.clear();
+        transcriptEditor.setTimestamps(nullptr);
+        transcriptEditor.setParagraphTimestamps({});
+        currentTimestamps = nullptr;
+        filteredTimestamps.clear();
+        filteredFullText.clear();
+        waveform.setAudioSource(nullptr);
+        lastHighlightedCharIndex = -1;
+    }
+}
+
+//==============================================================================
 //  激活源切换 —— 刷新进度条和文本
 //==============================================================================
 void TranscriptPluginEditor::onActiveSourceChanged(juce::ARAAudioSource* source)
@@ -438,6 +460,17 @@ void TranscriptPluginEditor::onActiveSourceChanged(juce::ARAAudioSource* source)
         DBG("================================");
         filteredTimestamps.clear();
         filteredFullText.clear();
+
+        // 预估内存并预分配，避免高频字符串内存扩容
+        {
+            size_t estimatedBytes = 0;
+            for (const auto& ts : data->timestamps)
+            {
+                if (ts.startTime >= viewRange.getStart() && ts.startTime < viewRange.getEnd())
+                    estimatedBytes += ts.character.length() + 1; // +1 为可能的换行符
+            }
+            filteredFullText.preallocateBytes(estimatedBytes);
+        }
 
         std::vector<TranscriptEditor::ParagraphTimestamp> paragraphTimestamps;
         bool isFirstParagraph = true;

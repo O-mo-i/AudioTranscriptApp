@@ -87,6 +87,9 @@ private:
         juce::ARAPlaybackRegion* region,
         juce::ARAPlaybackRegion::PropertiesPtr newProperties) override;
 
+    //── ARA 播放区域销毁（剪切/删除音频块时防止死锁与生命周期崩溃） ──
+    void willDestroyPlaybackRegion(juce::ARAPlaybackRegion* region) override;
+
     //── 成员 ────────────────────────────────
     TranscriptPluginProcessor& processor;
     TranscriptDataManager* dataManager = nullptr;
