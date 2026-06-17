@@ -1,6 +1,5 @@
 #pragma once
 #include <juce_audio_processors/juce_audio_processors.h>
-#include "WaveformComponent.h"
 #include "TranscriptEditor.h"
 #include "ASRProcessor.h"
 #include "CharacterTimestamp.h"
@@ -48,7 +47,6 @@ private:
     /** 定时轮询当前 ARA 选区，检测跨轨后的选择变更 */
     void pollSelectionChanged();
     void syncTextToAudio(int charIndex);
-    void syncAudioToText(double timeInSeconds);
     double findTimeByCharIndex(int charIndex) const;
     void startASR();
     void downloadModel();
@@ -99,7 +97,6 @@ private:
     TranscriptPluginProcessor& processor;
     TranscriptDataManager* dataManager = nullptr;
 
-    WaveformComponent waveform;
     TranscriptEditor transcriptEditor;
 
     void cleanupAll();

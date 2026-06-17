@@ -30,8 +30,6 @@ target_sources(AudioTranscriptEditor
         Source/PluginProcessor.cpp
         Source/PluginEditor.h
         Source/PluginEditor.cpp
-        Source/WaveformComponent.h
-        Source/WaveformComponent.cpp
         Source/TranscriptEditor.h
         Source/TranscriptEditor.cpp
         Source/CharacterTimestamp.h
