@@ -371,7 +371,7 @@ void TranscriptPluginEditor::onNewSelection(const juce::ARAViewSelection& select
     auto* newAudioSrc = newAudioMod->getAudioSource();
     if (newAudioSrc == nullptr) return;
 
-    //── 情况 1：同一条轨道的区域切换 → 仅换 region 监听和波形，不刷文本 ──
+    //── 情况 1：同一条轨道的区域切换 → 仅换 region 监听，不刷文本 ──
     if (newSequence != nullptr && newSequence == currentRegionSequence)
     {
         if (currentRegion)
@@ -380,11 +380,29 @@ void TranscriptPluginEditor::onNewSelection(const juce::ARAViewSelection& select
         currentRegion = newRegion;
         currentRegion->addListener(this);
 
+        // 更新 ASR 物理源指纹 & 按钮状态
+        dataManager->setActiveKey(TranscriptDataManager::makeSourceKey(newAudioSrc));
+        asrButton.setEnabled(true);
+        bool hasASR = dataManager->hasASRResult(TranscriptDataManager::makeSourceKey(newAudioSrc));
+        if (hasASR)
+        {
+            asrStatusLabel.setText(juce::String::fromUTF8("ASR \xe5\xb7\xb2\xe5\xae\x8c\xe6\x88\x90"),
+                                   juce::dontSendNotification);
+            asrStatusLabel.setColour(juce::Label::textColourId, juce::Colours::greenyellow);
+        }
+        else
+        {
+            asrStatusLabel.setText(juce::String::fromUTF8(
+                "\xe7\x82\xb9\xe5\x87\xbb ASR \xe5\xbc\x80\xe5\xa7\x8b\xe8\xaf\x86\xe5\x88\xab"),
+                                   juce::dontSendNotification);
+            asrStatusLabel.setColour(juce::Label::textColourId, juce::Colours::grey);
+        }
+
         // 仅更新波形（适配新音频块的相对总长度），绝对不动文本
         if (newAudioSrc != nullptr)
             waveform.setAudioSource(newAudioSrc);
 
-        return;  // ← 直接静默退出，文本框丝滑静止，无任何 repaint
+        return;  // ← 文本框丝滑静止，无任何 repaint
     }
 
     //── 情况 2：真正跨轨 → 执行全量切换 ──
