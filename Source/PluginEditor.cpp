@@ -367,7 +367,9 @@ void TranscriptPluginEditor::onNewSelection(const juce::ARAViewSelection& select
     auto* newRegion = regions.front();
     auto* newSequence = newRegion->getRegionSequence<juce::ARARegionSequence>();
     auto* newAudioMod = newRegion->getAudioModification<juce::ARAAudioModification>();
+    if (newAudioMod == nullptr) return;
     auto* newAudioSrc = newAudioMod->getAudioSource();
+    if (newAudioSrc == nullptr) return;
 
     //── 情况 1：同一条轨道的区域切换 → 仅换 region 监听和波形，不刷文本 ──
     if (newSequence != nullptr && newSequence == currentRegionSequence)
@@ -429,8 +431,9 @@ void TranscriptPluginEditor::willDestroyPlaybackRegion(juce::ARAPlaybackRegion* 
             {
                 currentRegion = remaining.front();
                 currentRegion->addListener(this);
-                auto* src = currentRegion->getAudioModification<juce::ARAAudioModification>()
-                            ->getAudioSource();
+                auto* replacementMod = currentRegion->getAudioModification<juce::ARAAudioModification>();
+                if (replacementMod == nullptr) { dataManager->setActiveSource(nullptr); return; }
+                auto* src = replacementMod->getAudioSource();
                 if (src != nullptr)
                 {
                     dataManager->setActiveSource(src);
@@ -541,8 +544,11 @@ void TranscriptPluginEditor::refreshTrackText()
     {
         // 没有序列上下文，降级为只显示当前音频源的单块文本
         JUCE_BLOCK_WITH_FORCED_SEMICOLON (
-            auto key = TranscriptDataManager::makeSourceKey(
-                currentRegion->getAudioModification<juce::ARAAudioModification>()->getAudioSource());
+            auto* fallbackMod = currentRegion->getAudioModification<juce::ARAAudioModification>();
+            if (fallbackMod == nullptr) return;
+            auto* fallbackSrc = fallbackMod->getAudioSource();
+            if (fallbackSrc == nullptr) return;
+            auto key = TranscriptDataManager::makeSourceKey(fallbackSrc);
             auto* data = dataManager->getDataForKey(key);
             if (data != nullptr && data->asrComplete)
             {
@@ -593,7 +599,10 @@ void TranscriptPluginEditor::refreshTrackText()
     size_t estimatedBytes = 0;
     for (auto* region : sortedRegions)
     {
-        auto* audioSrc = region->getAudioModification<juce::ARAAudioModification>()->getAudioSource();
+        auto* audioMod = region->getAudioModification<juce::ARAAudioModification>();
+        if (audioMod == nullptr) { estimatedBytes += 50; continue; }
+        auto* audioSrc = audioMod->getAudioSource();
+        if (audioSrc == nullptr) { estimatedBytes += 50; continue; }
         auto* data = dataManager->getDataForKey(TranscriptDataManager::makeSourceKey(audioSrc));
         if (data != nullptr && data->asrComplete)
         {
@@ -620,7 +629,9 @@ void TranscriptPluginEditor::refreshTrackText()
     for (auto* region : sortedRegions)
     {
         auto* audioMod = region->getAudioModification<juce::ARAAudioModification>();
+        if (audioMod == nullptr) continue;
         auto* audioSrc = audioMod->getAudioSource();
+        if (audioSrc == nullptr) continue;
         auto key = TranscriptDataManager::makeSourceKey(audioSrc);
         auto* data = dataManager->getDataForKey(key);
 
