@@ -49,6 +49,8 @@ private:
     void syncAudioToText(double timeInSeconds);
     double findTimeByCharIndex(int charIndex) const;
     void startASR();
+    void downloadModel();
+    void verifyModel();
 
     /** 计算当前切片在物理音频源中的视口区间 */
     juce::Range<double> getCurrentViewRange() const;
@@ -92,12 +94,16 @@ private:
     WaveformComponent waveform;
     TranscriptEditor transcriptEditor;
 
+    void cleanupAll();
+
     // ASR 控件
     juce::ComboBox modelSelector;
     juce::TextButton asrButton;
+    juce::TextButton cleanupButton;
+    juce::TextButton downloadButton;
+    juce::TextButton verifyButton;
     juce::Label asrStatusLabel;
     juce::ProgressBar asrProgressBar;
-    juce::ToggleButton offlineModeToggle;
     double asrProgressValue{ 0.0 };
 
     // ASR 引擎

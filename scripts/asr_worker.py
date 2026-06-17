@@ -51,6 +51,31 @@ CHUNK_SEC = 30.0       # 每块时长（秒）
 OVERLAP_SEC = 0.5       # 块间重叠（秒）
 
 
+def is_model_in_cache(model_name: str) -> bool:
+    """检测 HuggingFace 模型是否已在本地缓存中。"""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        # 检查 config.json 是否在缓存中
+        cached = try_to_load_from_cache(model_name, "config.json")
+        return cached is not None and cached is not False
+    except Exception:
+        pass
+    # 回退：检查 HuggingFace 默认缓存目录
+    try:
+        import os
+        hf_cache = os.path.expanduser("~/.cache/huggingface/hub")
+        if not os.path.isdir(hf_cache):
+            return False
+        safe_name = model_name.replace("/", "--")
+        model_dir = os.path.join(hf_cache, f"models--{safe_name}")
+        return os.path.isdir(model_dir) and any(
+            f.endswith(".json") or f.endswith(".bin") or f.endswith(".safetensors")
+            for f in os.listdir(os.path.join(model_dir, "snapshots"))
+        ) if os.path.isdir(os.path.join(model_dir, "snapshots")) else False
+    except Exception:
+        return False
+
+
 def align_punctuation(full_text, raw_words):
     """Align full-text (with punctuation) against raw timestamp words."""
     PUNCT_SET = set("，。？！、；：\n\r\t ")
@@ -240,9 +265,21 @@ def run_asr_qwen(audio_path: str, device: str, model_name: str) -> dict:
     log(f"加载模型: {model_name} device={device}")
     t0 = time.time()
     is_offline_mode = bool(os.environ.get("TRANSFORMERS_OFFLINE"))
+
+    # 自动检测缓存：模型已在本地时强制 local_files_only，避免网络卡死
+    model_in_cache = is_model_in_cache(model_name)
+    local_only = is_offline_mode or model_in_cache
+    if model_in_cache and not is_offline_mode:
+        log(f"检测到模型已缓存，自动启用 local_files_only=True（无需 --offline 参数）")
+
     forced_aligner_kwargs = {"dtype": dtype, "device_map": device_map}
-    if is_offline_mode:
+    if local_only:
         forced_aligner_kwargs["local_files_only"] = True
+
+    # 非缓存模式设置网络超时，防止 SYN_SENT 永久挂死
+    if not local_only:
+        os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
+        os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "10")
 
     try:
         model = Qwen3ASRModel.from_pretrained(
@@ -252,7 +289,7 @@ def run_asr_qwen(audio_path: str, device: str, model_name: str) -> dict:
             forced_aligner=forced_aligner_model,
             forced_aligner_kwargs=forced_aligner_kwargs,
             max_new_tokens=256,
-            local_files_only=is_offline_mode,
+            local_files_only=local_only,
         )
     except OSError as e:
         err_msg = str(e)
@@ -453,6 +490,126 @@ def run_asr_whisper(audio_path: str, device: str, model_name: str) -> dict:
     return {"success": True, "text": full_text, "words": words}
 
 
+def download_model_only(model_name: str, device: str,
+                        model_dir: str | None, offline_args: dict) -> dict:
+    """仅下载并缓存模型，不执行识别。
+
+    同时下载 ASR 模型和对应的 ForcedAligner 模型。
+    适用于首次使用前的模型预下载。
+    """
+    import torch
+
+    try:
+        resolved = resolve_model_path(model_name, model_dir)
+        log(f"正在下载模型: {resolved}")
+
+        # 检测缓存状态
+        if is_model_in_cache(model_name) and is_model_in_cache(
+                model_name.replace("ASR", "ForcedAligner")):
+            log("模型已全部缓存，无需下载")
+            return {"success": True, "text": "模型已存在", "words": []}
+
+        dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        device_map = device if torch.cuda.is_available() else "cpu"
+
+        # 推导 forced_aligner 名称
+        forced_aligner_model = model_name.replace("ASR", "ForcedAligner")
+
+        # 下载 ASR 模型
+        log("下载 ASR 模型中...")
+        from qwen_asr import Qwen3ASRModel
+        _ = Qwen3ASRModel.from_pretrained(
+            resolved,
+            dtype=dtype,
+            device_map=device_map,
+            max_new_tokens=256,
+            **offline_args,
+        )
+        log("ASR 模型下载完成")
+
+        # 下载 ForcedAligner 模型
+        log("下载 ForcedAligner 模型中...")
+        try:
+            _ = Qwen3ASRModel.from_pretrained(
+                forced_aligner_model,
+                dtype=dtype,
+                device_map=device_map,
+                max_new_tokens=256,
+                local_files_only=False,
+            )
+            log("ForcedAligner 模型下载完成")
+        except Exception as e:
+            log(f"ForcedAligner 模型下载失败（可忽略）: {e}")
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return {"success": True, "text": "模型下载完成", "words": []}
+
+    except Exception as e:
+        log(f"模型下载失败: {e}")
+        return {"success": False, "error": str(e)}
+
+
+def verify_model_online(model_name: str, device: str,
+                        model_dir: str | None) -> dict:
+    """联网校验模型完整性，检查缓存文件是否与 Hub 一致。
+
+    对比本地缓存文件与 HuggingFace Hub 上预期文件列表，
+    不自动下载缺失文件。
+    """
+    import time
+
+    resolved = resolve_model_path(model_name, model_dir)
+    log(f"正在校验模型: {resolved}")
+
+    # ── 本地缓存文件检查 ──────────────────────────
+    # 使用 is_model_in_cache 做快速检测（不依赖 huggingface_hub 导入）
+    asr_ok = is_model_in_cache(resolved)
+    forced_aligner_name = model_name.replace("ASR", "ForcedAligner")
+    fa_ok = is_model_in_cache(forced_aligner_name)
+
+    if asr_ok:
+        log("ASR 模型文件存在")
+    else:
+        log("ASR 模型文件缺失")
+    if fa_ok:
+        log("ForcedAligner 模型文件存在")
+    else:
+        log("ForcedAligner 模型文件缺失")
+
+    # ── 联网校验 ────────────────────────────────
+    hub_ok = False
+    hub_error = ""
+    try:
+        from huggingface_hub import model_info
+        _ = model_info(model_name, timeout=15)
+        hub_ok = True
+        log("已连接到 HuggingFace Hub")
+    except Exception as e:
+        hub_error = str(e)
+        log(f"无法连接到 HuggingFace Hub: {hub_error}")
+
+    # ── 结果判定 ─────────────────────────────────
+    all_local = asr_ok and fa_ok
+
+    if hub_ok and all_local:
+        return {"success": True, "status": "ok",
+                "text": "模型完整，与 Hub 一致"}
+    elif not hub_ok and all_local:
+        return {"success": True, "status": "ok_local",
+                "text": "本地模型文件完整（无法联网验证）"}
+    elif hub_ok and not all_local:
+        return {"success": True, "status": "needs_download",
+                "text": '模型不完整，请点击"下载模型"'}
+    elif not all_local:
+        return {"success": True, "status": "needs_download",
+                "text": '模型文件缺失，请点击"下载模型"'}
+    else:
+        return {"success": True, "status": "ok_local",
+                "text": "本地模型文件完整（无法联网验证完整性）"}
+
+
 def run_asr(audio_path: str, device: str, model_name: str) -> dict:
     # CUDA 自动降级
     if device == "cuda":
@@ -488,7 +645,7 @@ def resolve_model_path(model_name: str, model_dir: str | None) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description="ASR 语音识别字级时间戳")
-    parser.add_argument("--audio", required=True, help="音频文件路径 (wav/mp3/flac)")
+    parser.add_argument("--audio", help="音频文件路径 (wav/mp3/flac)")
     parser.add_argument("--device", default="cuda", help="推理设备: cuda / cpu (默认 cuda)")
     parser.add_argument("--model", default="Qwen/Qwen3-ASR-0.6B",
                         help="HuggingFace 模型名 (默认 Qwen/Qwen3-ASR-0.6B)")
@@ -496,6 +653,10 @@ def main():
                         help="离线模式：禁止所有网络请求，仅从本地缓存加载模型")
     parser.add_argument("--model-dir", default=None,
                         help="本地模型目录路径（离线模式下从此路径加载模型，不联网下载）")
+    parser.add_argument("--download-only", action="store_true",
+                        help="仅下载模型到本地缓存，不执行识别")
+    parser.add_argument("--verify-only", action="store_true",
+                        help="仅联网校验模型完整性，不下载不识别")
     args = parser.parse_args()
 
     # ── 离线模式设置 ──────────────────────────
@@ -512,11 +673,27 @@ def main():
         os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "5"
         os.environ["HF_HUB_ETAG_TIMEOUT"] = "5"
 
+    # ── 下载模式：仅下载模型，不执行识别 ──────────
+    if args.download_only:
+        log(f"下载模式: 仅下载模型 {args.model} 到本地缓存")
+        result = download_model_only(
+            args.model, args.device, args.model_dir,
+            {"local_files_only": False})
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+        sys.exit(0 if result.get("success") else 1)
+
+    if args.verify_only:
+        log(f"校验模式: 联网检查模型 {args.model} 完整性")
+        result = verify_model_online(
+            args.model, args.device, args.model_dir)
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+        sys.exit(0 if result.get("success") else 1)
+
     # 解析模型路径（支持本地目录）
     resolved_model = resolve_model_path(args.model, args.model_dir)
     log(f"模型路径: {resolved_model}")
 
-    if not os.path.isfile(args.audio):
+    if not args.audio or not os.path.isfile(args.audio):
         print(json.dumps({"success": False, "error": f"文件不存在: {args.audio}"}),
               file=sys.stderr)
         sys.exit(1)

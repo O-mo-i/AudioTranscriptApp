@@ -110,20 +110,29 @@ TranscriptPluginEditor::TranscriptPluginEditor(TranscriptPluginProcessor& p)
     asrButton.setEnabled(false);
     addAndMakeVisible(asrButton);
 
-    // 离线模式开关
-    offlineModeToggle.setButtonText(juce::String::fromUTF8(
-        "\xe7\xa6\xbb\xe7\xba\xbf\xe6\xa8\xa1\xe5\xbc\x8f"));
-    offlineModeToggle.setTooltip(juce::String::fromUTF8(
-        "\xe5\x90\xaf\xe7\x94\xa8\xe5\x90\x8e\xe4\xbb\x85\xe4\xbb\x8e\xe6\x9c\xac\xe5\x9c\xb0"
-        "\xe7\xbc\x93\xe5\xad\x98\xe5\x8a\xa0\xe8\xbd\xbd\xe6\xa8\xa1\xe5\x9e\x8b\xef\xbc\x8c"
-        "\xe4\xb8\x8d\xe8\xbf\x9e\xe7\xbd\x91\xe4\xb8\x8b\xe8\xbd\xbd"));
-    offlineModeToggle.setToggleState(ASRProcessor::isOfflineMode(), juce::dontSendNotification);
-    offlineModeToggle.onStateChange = [this]()
-    {
-        bool offline = offlineModeToggle.getToggleState();
-        ASRProcessor::setOfflineMode(offline);
-    };
-    addAndMakeVisible(offlineModeToggle);
+    cleanupButton.setButtonText(juce::String::fromUTF8("\xe6\xb8\x85\xe7\x90\x86"));
+    cleanupButton.onClick = [this] { cleanupAll(); };
+    addAndMakeVisible(cleanupButton);
+
+    downloadButton.setButtonText(juce::String::fromUTF8(
+        "\xe4\xb8\x8b\xe8\xbd\xbd\xe6\xa8\xa1\xe5\x9e\x8b"));
+    downloadButton.setTooltip(juce::String::fromUTF8(
+        "\xe9\xa6\x96\xe6\xac\xa1\xe4\xbd\xbf\xe7\x94\xa8\xe5\x89\x8d\xe5\x9c\xa8"
+        "\xe6\x9c\x89\xe7\xbd\x91\xe7\x8e\xaf\xe5\xa2\x83\xe4\xb8\x8b\xe7\x82\xb9"
+        "\xe5\x87\xbb\xe6\xad\xa4\xe6\x8c\x89\xe9\x92\xae\xef\xbc\x8c\xe4\xb8\x8b"
+        "\xe8\xbd\xbd\xe6\x89\x80\xe9\x9c\x80\xe7\x9a\x84\xe6\xa8\xa1\xe5\x9e\x8b"
+        "\xe5\x88\xb0\xe6\x9c\xac\xe5\x9c\xb0\xe7\xbc\x93\xe5\xad\x98"));
+    downloadButton.onClick = [this] { downloadModel(); };
+    addAndMakeVisible(downloadButton);
+
+    verifyButton.setButtonText(juce::String::fromUTF8(
+        "\xe8\x81\x94\xe7\xbd\x91\xe6\xa0\xa1\xe9\xaa\x8c"));
+    verifyButton.setTooltip(juce::String::fromUTF8(
+        "\xe8\x81\x94\xe7\xbd\x91\xe6\xa3\x80\xe6\x9f\xa5\xe6\xa8\xa1\xe5\x9e\x8b"
+        "\xe6\x96\x87\xe4\xbb\xb6\xe5\xae\x8c\xe6\x95\xb4\xe6\x80\xa7\xef\xbc\x8c"
+        "\xe4\xb8\x8d\xe8\x87\xaa\xe5\x8a\xa8\xe4\xb8\x8b\xe8\xbd\xbd"));
+    verifyButton.onClick = [this] { verifyModel(); };
+    addAndMakeVisible(verifyButton);
 
     asrStatusLabel.setText(juce::String::fromUTF8("\xe5\x9c\xa8 Studio One \xe4\xb8\xad\xe9\x80\x89\xe4\xb8\xad\xe9\x9f\xb3\xe9\xa2\x91\xe7\x89\x87\xe6\xae\xb5\xe5\x90\x8e\xe5\x8f\xaf\xe8\xbf\x9b\xe8\xa1\x8c ASR \xe8\xaf\x86\xe5\x88\xab"),
                            juce::dontSendNotification);
@@ -261,14 +270,15 @@ void TranscriptPluginEditor::resized()
 
     asrProgressBar.setBounds(getWidth() - 350, 5, 340, 14);
 
-    const int btnW = 70;
-    const int comboW = 220;
-    const int toggleW = 90;
+    const int btnW = 60;
+    const int comboW = 190;
     const int gap = 4;
 
-    offlineModeToggle.setBounds(controlArea.removeFromLeft(toggleW).reduced(gap));
     modelSelector.setBounds(controlArea.removeFromLeft(comboW).reduced(gap));
+    downloadButton.setBounds(controlArea.removeFromLeft(btnW + 20).reduced(gap));
+    verifyButton.setBounds(controlArea.removeFromLeft(btnW + 10).reduced(gap));
     asrButton.setBounds(controlArea.removeFromLeft(btnW).reduced(gap));
+    cleanupButton.setBounds(controlArea.removeFromLeft(btnW).reduced(gap));
 }
 
 //==============================================================================
@@ -535,6 +545,135 @@ double TranscriptPluginEditor::findTimeByCharIndex(int charIndex) const
             return ts.startTime;
     }
     return -1.0;
+}
+
+//==============================================================================
+//  下载模型到本地缓存
+//==============================================================================
+void TranscriptPluginEditor::downloadModel()
+{
+    static const std::pair<int, juce::String> models[] = {
+        {1, "Qwen/Qwen3-ASR-0.6B"},
+        {2, "openai/whisper-small"},
+        {3, "openai/whisper-medium"},
+        {4, "openai/whisper-large-v3"},
+    };
+    juce::String chosen = "Qwen/Qwen3-ASR-0.6B";
+    for (auto& m : models)
+    {
+        if (m.first == modelSelector.getSelectedId()) { chosen = m.second; break; }
+    }
+
+    downloadButton.setEnabled(false);
+    asrButton.setEnabled(false);
+    asrStatusLabel.setText(juce::String::fromUTF8(
+        "\xe6\xad\xa3\xe5\x9c\xa8\xe4\xb8\x8b\xe8\xbd\xbd\xe6\xa8\xa1\xe5\x9e\x8b: ")
+        + chosen + " ...", juce::dontSendNotification);
+    asrStatusLabel.setColour(juce::Label::textColourId, juce::Colours::yellow);
+
+    asrProcessor.onDownloadComplete = [this](bool success, const juce::String& msg)
+    {
+        downloadButton.setEnabled(true);
+        asrButton.setEnabled(true);
+        asrStatusLabel.setText(msg, juce::dontSendNotification);
+        asrStatusLabel.setColour(juce::Label::textColourId,
+            success ? juce::Colours::greenyellow : juce::Colours::orangered);
+    };
+
+    asrProcessor.startDownload(chosen);
+}
+
+//==============================================================================
+//  联网校验模型完整性
+//==============================================================================
+void TranscriptPluginEditor::verifyModel()
+{
+    static const std::pair<int, juce::String> models[] = {
+        {1, "Qwen/Qwen3-ASR-0.6B"},
+        {2, "openai/whisper-small"},
+        {3, "openai/whisper-medium"},
+        {4, "openai/whisper-large-v3"},
+    };
+    juce::String chosen = "Qwen/Qwen3-ASR-0.6B";
+    for (auto& m : models)
+    {
+        if (m.first == modelSelector.getSelectedId()) { chosen = m.second; break; }
+    }
+
+    verifyButton.setEnabled(false);
+    asrStatusLabel.setText(juce::String::fromUTF8(
+        "\xe6\xad\xa3\xe5\x9c\xa8\xe8\x81\x94\xe7\xbd\x91\xe6\xa0\xa1\xe9\xaa\x8c"
+        "\xe6\xa8\xa1\xe5\x9e\x8b: ") + chosen + " ...",
+        juce::dontSendNotification);
+    asrStatusLabel.setColour(juce::Label::textColourId, juce::Colours::yellow);
+
+    asrProcessor.onDownloadComplete = [this](bool success, const juce::String& msg)
+    {
+        verifyButton.setEnabled(true);
+        asrStatusLabel.setText(msg, juce::dontSendNotification);
+        asrStatusLabel.setColour(juce::Label::textColourId,
+            success ? juce::Colours::greenyellow : juce::Colours::orangered);
+    };
+
+    asrProcessor.startVerify(chosen);
+}
+
+//==============================================================================
+//  清理所有残留文件和保存的数据
+//==============================================================================
+void TranscriptPluginEditor::cleanupAll()
+{
+    // 1. 删除临时音频文件
+    if (tempAudioFile.exists())
+    {
+        tempAudioFile.deleteFile();
+        tempAudioFile = {};
+    }
+
+    // 2. 删除调试日志（asr_debug.log，在宿主可执行文件同目录）
+    auto logFile = ASRProcessor::getDebugLogFile();
+    if (logFile.exists())
+        logFile.deleteFile();
+
+    // 3. 删除 ASR 调试转储（asr_debug_dump.json，在用户主目录）
+    auto dumpFile = juce::File::getSpecialLocation(
+        juce::File::userHomeDirectory).getChildFile("asr_debug_dump.json");
+    if (dumpFile.exists())
+        dumpFile.deleteFile();
+
+    // 4. 清除所有转录数据（内存 + 下次 DAW 保存时 ARA 持久化也会清空）
+    dataManager->clear();
+
+    // 5. 清除 UI
+    transcriptEditor.clear();
+    transcriptEditor.setTimestamps(nullptr);
+    transcriptEditor.setParagraphTimestamps({});
+    currentTimestamps = nullptr;
+    waveform.setAudioSource(nullptr);
+    lastHighlightedCharIndex = -1;
+    filteredTimestamps.clear();
+    filteredFullText.clear();
+
+    // 6. 刷新 UI 到当前选区（显示"无数据"状态）
+    if (currentRegion)
+    {
+        auto* audioMod = currentRegion->getAudioModification<juce::ARAAudioModification>();
+        if (auto* src = audioMod->getAudioSource())
+        {
+            dataManager->setActiveSource(src);
+            // setActiveSource -> onActiveSourceChanged 会刷新 UI
+        }
+    }
+    else
+    {
+        onActiveSourceChanged(nullptr);
+    }
+
+    asrStatusLabel.setText(juce::String::fromUTF8(
+        "\xe5\xb7\xb2\xe6\xb8\x85\xe9\x99\xa4\xe6\x89\x80\xe6\x9c\x89\xe7\xbc\x93"
+        "\xe5\xad\x98\xe5\x92\x8c\xe4\xbf\x9d\xe5\xad\x98\xe7\x9a\x84\xe6\x95\xb0\xe6\x8d\xae"),
+        juce::dontSendNotification);
+    asrStatusLabel.setColour(juce::Label::textColourId, juce::Colours::lightgrey);
 }
 
 //==============================================================================

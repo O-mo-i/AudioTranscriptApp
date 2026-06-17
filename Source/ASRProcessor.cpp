@@ -10,10 +10,14 @@
 static void logToFile(const juce::String& msg)
 {
     DBG(msg);
-    auto logFile = juce::File::getSpecialLocation(
+    ASRProcessor::getDebugLogFile().appendText(msg + "\n", false, false);
+}
+
+juce::File ASRProcessor::getDebugLogFile()
+{
+    return juce::File::getSpecialLocation(
         juce::File::currentExecutableFile).getParentDirectory()
         .getChildFile("asr_debug.log");
-    logFile.appendText(msg + "\n", false, false);
 }
 
 // 获取 .vst3 插件 DLL 自身的路径（非宿主路径）
@@ -40,7 +44,6 @@ juce::String ASRProcessor::pythonPath;
 juce::String ASRProcessor::modelName       = "openai/whisper-small";
 juce::String ASRProcessor::deviceName      = "cuda";
 juce::String ASRProcessor::scriptsDirectory;
-bool ASRProcessor::offlineMode  = true;    // 默认离线模式
 juce::String ASRProcessor::modelDirectory;
 
 ASRProcessor::ASRProcessor()
@@ -51,7 +54,26 @@ ASRProcessor::~ASRProcessor() { cancel(); }
 void ASRProcessor::start(const juce::File& file)
 {
     cancel();
+    currentModelOp = ModelOp::kNone;
     audioFile = file;
+    isActive = true;
+    startThread();
+}
+
+void ASRProcessor::startDownload(const juce::String& modelName)
+{
+    cancel();
+    currentModelOp = ModelOp::kDownload;
+    downloadModelName = modelName;
+    isActive = true;
+    startThread();
+}
+
+void ASRProcessor::startVerify(const juce::String& modelName)
+{
+    cancel();
+    currentModelOp = ModelOp::kVerify;
+    downloadModelName = modelName;
     isActive = true;
     startThread();
 }
@@ -84,6 +106,12 @@ void ASRProcessor::callError(const juce::String& msg)
 void ASRProcessor::run()
 {
     isActive = true;
+
+    if (currentModelOp != ModelOp::kNone)
+    {
+        runModelOp();
+        return;
+    }
 
     auto quote = [](const juce::String& s) { return "\"" + s + "\""; };
 
@@ -158,15 +186,13 @@ void ASRProcessor::run()
         << " --device " << deviceName
         << " --model " << quote(modelName);
 
-    // 离线模式
-    if (offlineMode)
-        cmd << " --offline";
+    // 始终离线运行（模型必须已在本地缓存）
+    cmd << " --offline";
 
     // 本地模型目录
     if (modelDirectory.isNotEmpty())
         cmd << " --model-dir " << quote(modelDirectory);
 
-    logToFile(juce::String("[ASR] offline: ") + (offlineMode ? "yes" : "no"));
     if (modelDirectory.isNotEmpty())
         logToFile("[ASR] model-dir: " + modelDirectory);
 
@@ -343,9 +369,146 @@ void ASRProcessor::run()
 }
 
 //==============================================================================
+void ASRProcessor::runModelOp()
+{
+    logToFile("[ASR] start model op (" + juce::String(
+        currentModelOp == ModelOp::kDownload ? "download" : "verify")
+        + ") for: " + downloadModelName);
+
+    // 复用 run() 中的路径解析逻辑，提取 vst3Dir
+    juce::File vst3Dir;
+
+   #if JUCE_WINDOWS
+    auto dllFile = getPluginDllPath();
+    if (dllFile.exists())
+    {
+        auto dllParent = dllFile.getParentDirectory();
+        auto contentsDir = dllParent.getParentDirectory();
+        auto bundleDir   = contentsDir.getParentDirectory();
+        if (bundleDir.getFileExtension().toLowerCase() == ".vst3")
+            vst3Dir = bundleDir.getParentDirectory();
+    }
+   #endif
+
+    if (vst3Dir == juce::File{})
+    {
+        auto exeDir = juce::File::getSpecialLocation(
+            juce::File::currentExecutableFile).getParentDirectory();
+        vst3Dir = exeDir.getParentDirectory().getParentDirectory();
+    }
+
+    logToFile("[ASR-DL] vst3 base dir: " + vst3Dir.getFullPathName());
+
+    juce::File scriptsDir = vst3Dir.getChildFile("scripts");
+    juce::File pythonExeFile = scriptsDir.getChildFile(".venv")
+                                        .getChildFile("Scripts")
+                                        .getChildFile("python.exe");
+    juce::File pythonScriptFile = scriptsDir.getChildFile("asr_worker.py");
+
+    if (!pythonExeFile.existsAsFile() || !pythonScriptFile.existsAsFile())
+    {
+        callError("Python or script not found in " + scriptsDir.getFullPathName());
+        return;
+    }
+
+    auto quote = [](const juce::String& s) { return "\"" + s + "\""; };
+
+    juce::String opFlag = (currentModelOp == ModelOp::kDownload)
+        ? "--download-only" : "--verify-only";
+
+    juce::String cmd;
+    cmd << quote(pythonExeFile.getFullPathName())
+        << " " << quote(pythonScriptFile.getFullPathName())
+        << " " << opFlag
+        << " --device " << deviceName
+        << " --model " << quote(downloadModelName);
+
+    if (modelDirectory.isNotEmpty())
+        cmd << " --model-dir " << quote(modelDirectory);
+
+    logToFile("[ASR] cmd: " + cmd);
+
+    juce::ChildProcess proc;
+    if (!proc.start(cmd, juce::ChildProcess::wantStdOut | juce::ChildProcess::wantStdErr))
+    {
+        callError("Failed to start Python process for model download.");
+        return;
+    }
+
+    // 读取 stdout（JSON 结果行）
+    juce::String jsonLine;
+    char buf[4096];
+    while (proc.isRunning() && !threadShouldExit())
+    {
+        if (auto n = proc.readProcessOutput(buf, sizeof(buf)))
+        {
+            juce::String chunk = juce::String::fromUTF8(buf, (int)n);
+            for (auto& line : juce::StringArray::fromLines(chunk))
+            {
+                line = line.trim();
+                if (line.startsWith("PROGRESS:"))
+                {
+                    // 暂不处理下载进度
+                }
+                else if (line.startsWith("{") && line.endsWith("}"))
+                {
+                    jsonLine = line;
+                }
+            }
+        }
+        else
+        {
+            wait(50);
+        }
+    }
+
+    // 残余输出
+    char tail[4096];
+    while (auto n = proc.readProcessOutput(tail, sizeof(tail)))
+    {
+        juce::String chunk = juce::String::fromUTF8(tail, (int)n);
+        for (auto& line : juce::StringArray::fromLines(chunk))
+        {
+            line = line.trim();
+            if (line.startsWith("{") && line.endsWith("}"))
+                jsonLine = line;
+        }
+    }
+
+    logToFile("[ASR-DL] exit code: " + juce::String(proc.getExitCode()));
+    logToFile("[ASR-DL] jsonLine: " + jsonLine);
+
+    isActive = false;
+
+    bool success = false;
+    juce::String message;
+
+    if (jsonLine.isNotEmpty())
+    {
+        auto json = juce::JSON::parse(jsonLine);
+        success = json.hasProperty("success") && (bool)json["success"];
+        message = success ? juce::String::fromUTF8("\xe6\xa8\xa1\xe5\x9e\x8b\xe4\xb8\x8b\xe8\xbd\xbd\xe5\xae\x8c\xe6\x88\x90")
+                          : json["error"].toString();
+        if (!success && message.isEmpty())
+            message = juce::String::fromUTF8("\xe6\xa8\xa1\xe5\x9e\x8b\xe4\xb8\x8b\xe8\xbd\xbd\xe5\xa4\xb1\xe8\xb4\xa5");
+    }
+    else
+    {
+        message = juce::String::fromUTF8("\xe6\x97\xa0\xe6\xb3\x95\xe8\x8e\xb7\xe5\x8f\x96\xe4\xb8\x8b\xe8\xbd\xbd\xe7\xbb\x93\xe6\x9e\x9c");
+    }
+
+    if (onDownloadComplete)
+    {
+        juce::MessageManager::callAsync([this, success, message]()
+        {
+            onDownloadComplete(success, message);
+        });
+    }
+}
+
+//==============================================================================
 void ASRProcessor::setPythonPath(const juce::String& path)      { pythonPath = path; }
 void ASRProcessor::setModelName(const juce::String& m)         { modelName  = m; }
 void ASRProcessor::setDevice(const juce::String& d)            { deviceName = d; }
 void ASRProcessor::setScriptsDirectory(const juce::String& p)  { scriptsDirectory = p; }
-void ASRProcessor::setOfflineMode(bool offline)                { offlineMode = offline; }
 void ASRProcessor::setModelDirectory(const juce::String& p)    { modelDirectory = p; }
