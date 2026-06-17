@@ -126,6 +126,13 @@ private:
 
     /** 上次实际传给 TextEditor 的文本，用于跳过重复的 setText */
     juce::String lastSetText;
+    /** 缓存当前轨道的拼接结果，跨轨切回时避免全文重织 */
+    struct TrackCache {
+        juce::ARARegionSequence* sequence = nullptr;
+        juce::String fullText;
+        std::vector<CharacterTimestamp> timestamps;
+        std::vector<TranscriptEditor::ParagraphTimestamp> paragraphTimestamps;
+    } trackCache;
 
     //── 播放高亮防抖 ────────────────────────
     int lastHighlightedCharIndex = -1;

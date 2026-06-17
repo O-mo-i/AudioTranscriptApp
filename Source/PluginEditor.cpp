@@ -386,11 +386,10 @@ void TranscriptPluginEditor::onNewSelection(const juce::ARAViewSelection& select
         }
 
         // 仅更新波形（适配新音频块的相对总长度），绝对不动文本
-        if (newAudioSrc != nullptr)
         return;  // ← 文本框丝滑静止，无任何 repaint
     }
 
-    //── 情况 2：真正跨轨 → 执行全量切换 ──
+    //── 情况 2：真正跨轨 → 检查缓存，命中则跳过全文重织 ──
     if (currentRegion)
         currentRegion->removeListener(this);
 
@@ -398,6 +397,32 @@ void TranscriptPluginEditor::onNewSelection(const juce::ARAViewSelection& select
     currentRegionSequence = newSequence;
     currentRegion->addListener(this);
 
+    // 缓存命中：直接恢复上次为该轨道构建的文本
+    if (trackCache.sequence == newSequence)
+    {
+        filteredFullText    = trackCache.fullText;
+        filteredTimestamps  = trackCache.timestamps;
+        if (filteredFullText != lastSetText)
+        {
+            lastSetText = filteredFullText;
+            transcriptEditor.setText(filteredFullText, juce::dontSendNotification);
+        }
+        transcriptEditor.setTimestamps(&filteredTimestamps);
+        transcriptEditor.setParagraphTimestamps(trackCache.paragraphTimestamps);
+        transcriptEditor.setTimeOffset(0.0);
+        currentTimestamps = &filteredTimestamps;
+        asrButton.setEnabled(true);
+        asrStatusLabel.setText(juce::String::fromUTF8(
+            "\xe6\x95\xb4\xe8\xbd\xa8\xe6\x96\x87\xe6\x9c\xac\xe5\xb7\xb2\xe5\x8a\xa0\xe8\xbd\xbd"),
+                               juce::dontSendNotification);
+        asrStatusLabel.setColour(juce::Label::textColourId, juce::Colours::greenyellow);
+
+        if (newAudioSrc != nullptr)
+            dataManager->setActiveKey(TranscriptDataManager::makeSourceKey(newAudioSrc));
+        return;
+    }
+
+    // 缓存未命中：全量刷新
     if (newAudioSrc != nullptr)
         dataManager->setActiveSource(newAudioSrc);
 }
@@ -511,10 +536,9 @@ void TranscriptPluginEditor::onActiveSourceChanged(juce::ARAAudioSource* source)
     }
     else
     {
-        transcriptEditor.clear();
+        // 不清空编辑器，保留上次文本；仅关停高亮和跳转
         transcriptEditor.setTimestamps(nullptr);
         currentTimestamps = nullptr;
-        lastSetText.clear();
         asrButton.setEnabled(true);
         asrStatusLabel.setText(juce::String::fromUTF8(
             "\xe7\x82\xb9\xe5\x87\xbb ASR \xe5\xbc\x80\xe5\xa7\x8b\xe8\xaf\x86\xe5\x88\xab"),
@@ -759,6 +783,13 @@ void TranscriptPluginEditor::refreshTrackText()
     transcriptEditor.setParagraphTimestamps(paragraphTimestamps);
     transcriptEditor.setTimeOffset(0.0);
     currentTimestamps = &filteredTimestamps;
+
+    // 缓存本次构建结果，跨轨切回时跳过全文重织
+    trackCache.sequence = currentRegionSequence;
+    trackCache.fullText = filteredFullText;
+    trackCache.timestamps = filteredTimestamps;
+    trackCache.paragraphTimestamps = paragraphTimestamps;
+
     asrButton.setEnabled(true);
     asrStatusLabel.setText(juce::String::fromUTF8(
         "\xe6\x95\xb4\xe8\xbd\xa8\xe6\x96\x87\xe6\x9c\xac\xe5\xb7\xb2\xe5\x8a\xa0\xe8\xbd\xbd"),
