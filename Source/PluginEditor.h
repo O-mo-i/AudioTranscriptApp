@@ -43,6 +43,8 @@ private:
     //── 内部工具 ────────────────────────────
     void timerCallback() override;
     void onActiveSourceChanged(juce::ARAAudioSource* source);
+    /** 重织整轨文本：遍历当前 Track 的所有 Regions，按宿主时间轴排序后拼接显示 */
+    void refreshTrackText();
     /** 定时轮询当前 ARA 选区，检测跨轨后的选择变更 */
     void pollSelectionChanged();
     void syncTextToAudio(int charIndex);
@@ -90,6 +92,9 @@ private:
     //── ARA 播放区域销毁（剪切/删除音频块时防止死锁与生命周期崩溃） ──
     void willDestroyPlaybackRegion(juce::ARAPlaybackRegion* region) override;
 
+    //── ARA 播放区域属性已更新（音频块拖动/属性变化后重织文本） ──
+    void didUpdatePlaybackRegionProperties(juce::ARAPlaybackRegion* region) override;
+
     //── 成员 ────────────────────────────────
     TranscriptPluginProcessor& processor;
     TranscriptDataManager* dataManager = nullptr;
@@ -127,6 +132,9 @@ private:
 
     //── 当前 ARA 播放区域（实时监听属性变化） ──
     juce::ARAPlaybackRegion* currentRegion = nullptr;
+
+    //── 当前 ARA Region Sequence（对应宿主 Track，用于整轨拼接） ──
+    juce::ARARegionSequence* currentRegionSequence = nullptr;
 
     //── 定时轮询选区计数器（30Hz 定时器，每 15 帧 = ~500ms 检查一次） ──
     int selectionPollCounter = 0;

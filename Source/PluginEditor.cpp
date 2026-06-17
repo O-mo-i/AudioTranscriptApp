@@ -283,6 +283,7 @@ void TranscriptPluginEditor::resized()
 
 //==============================================================================
 //  定时器：轮询播放头位置并驱动进度条 + 文本高亮
+//  播放头位置直接与重织后的整轨全局时间轴进行比对
 //==============================================================================
 void TranscriptPluginEditor::timerCallback()
 {
@@ -290,16 +291,10 @@ void TranscriptPluginEditor::timerCallback()
     bool isPlaying = phs.isPlaying.load(std::memory_order_relaxed);
     double absPos = phs.timeInSeconds.load(std::memory_order_relaxed);
 
-    // 实时换算为音频块相对时间
+    // 实时换算为音频块相对时间（波形图）
     double sourceRelTime = juce::jmax(0.0, absoluteToSourceTime(absPos));
 
     waveform.setPlayheadPosition(sourceRelTime);
-
-    //── 实时更新段落时间戳偏移量（适配音频块拖动、剪切） ──
-    {
-        double offset = (currentRegion != nullptr) ? (getRegionPlaybackStart() - getViewStart()) : 0.0;
-        transcriptEditor.setTimeOffset(offset);
-    }
 
     //── 定时轮询当前 ARA 选区（兜底跨轨断链） ──
     if (++selectionPollCounter >= 15)  // 每隔 ~500ms 检查一次
@@ -308,17 +303,18 @@ void TranscriptPluginEditor::timerCallback()
         pollSelectionChanged();
     }
 
-    if (!isPlaying || currentTimestamps == nullptr)
+    if (!isPlaying || currentTimestamps == nullptr || currentTimestamps->empty())
         return;
 
+    // 直接对比整轨全局时间轴
     for (const auto& ts : *currentTimestamps)
     {
-        if (sourceRelTime >= ts.startTime && sourceRelTime < ts.endTime)
+        if (absPos >= ts.startTime && absPos < ts.endTime)
         {
             if (ts.globalTextIndex != lastHighlightedCharIndex)
             {
                 lastHighlightedCharIndex = ts.globalTextIndex;
-                transcriptEditor.highlightByTime(sourceRelTime);
+                transcriptEditor.highlightByTime(absPos);
             }
             return;
         }
@@ -377,6 +373,7 @@ void TranscriptPluginEditor::onNewSelection(const juce::ARAViewSelection& select
         currentRegion->removeListener(this);
 
     currentRegion = regions.front();
+    currentRegionSequence = currentRegion->getRegionSequence<juce::ARARegionSequence>();
     auto* audioMod = currentRegion->getAudioModification<juce::ARAAudioModification>();
     auto* audioSource = audioMod->getAudioSource();
 
@@ -405,20 +402,62 @@ void TranscriptPluginEditor::willUpdatePlaybackRegionProperties(
 //==============================================================================
 void TranscriptPluginEditor::willDestroyPlaybackRegion(juce::ARAPlaybackRegion* region)
 {
+    // 情况 1：被销毁的正是当前选中的 region
     if (region == currentRegion)
     {
         currentRegion->removeListener(this);
         currentRegion = nullptr;
 
-        // 安全清空相关 UI 状态
-        transcriptEditor.clear();
-        transcriptEditor.setTimestamps(nullptr);
-        transcriptEditor.setParagraphTimestamps({});
-        currentTimestamps = nullptr;
-        filteredTimestamps.clear();
-        filteredFullText.clear();
-        waveform.setAudioSource(nullptr);
-        lastHighlightedCharIndex = -1;
+        // 尝试在当前 RegionSequence 中找一块替代 region
+        if (currentRegionSequence != nullptr)
+        {
+            auto remaining = currentRegionSequence->getPlaybackRegions<juce::ARAPlaybackRegion>();
+            if (!remaining.empty())
+            {
+                currentRegion = remaining.front();
+                currentRegion->addListener(this);
+                auto* src = currentRegion->getAudioModification<juce::ARAAudioModification>()
+                            ->getAudioSource();
+                if (src != nullptr)
+                {
+                    dataManager->setActiveSource(src);
+                    return; // setActiveSource → onActiveSourceChanged → refreshTrackText
+                }
+            }
+        }
+
+        // 无替代 → 清空 UI
+        dataManager->setActiveSource(nullptr);
+        return;
+    }
+
+    // 情况 2：被销毁的 region 属于当前正在显示的 RegionSequence → 重织整轨文本
+    if (currentRegionSequence != nullptr && currentRegion != nullptr)
+    {
+        auto* seq = region->getRegionSequence<juce::ARARegionSequence>();
+        if (seq == currentRegionSequence)
+        {
+            refreshTrackText();
+            return;
+        }
+    }
+}
+
+//==============================================================================
+//  ARA 播放区域属性已更新 —— 用户拖动音频块后重织整轨文本
+//==============================================================================
+void TranscriptPluginEditor::didUpdatePlaybackRegionProperties(juce::ARAPlaybackRegion* region)
+{
+    juce::ignoreUnused(region);
+
+    // 如果更新的是当前序列中的 region（含 currentRegion），刷新整轨时间戳
+    if (currentRegionSequence != nullptr && currentRegion != nullptr)
+    {
+        auto* seq = region->getRegionSequence<juce::ARARegionSequence>();
+        if (seq == currentRegionSequence)
+        {
+            refreshTrackText();
+        }
     }
 }
 
@@ -451,66 +490,7 @@ void TranscriptPluginEditor::onActiveSourceChanged(juce::ARAAudioSource* source)
     auto* data = dataManager->getDataForKey(key);
     if (data != nullptr && data->asrComplete)
     {
-        // 按当前视口过滤：直接用时间戳判断，逐字重织新文本
-        auto viewRange = getCurrentViewRange();
-        DBG("====== [VIEW RANGE CHECK] ======");
-        DBG("viewStart: " + juce::String(viewRange.getStart()));
-        DBG("viewEnd:   " + juce::String(viewRange.getEnd()));
-        DBG("Total source timestamps: " + juce::String((int)data->timestamps.size()));
-        DBG("================================");
-        filteredTimestamps.clear();
-        filteredFullText.clear();
-
-        // 预估内存并预分配，避免高频字符串内存扩容
-        {
-            size_t estimatedBytes = 0;
-            for (const auto& ts : data->timestamps)
-            {
-                if (ts.startTime >= viewRange.getStart() && ts.startTime < viewRange.getEnd())
-                    estimatedBytes += ts.character.length() + 1; // +1 为可能的换行符
-            }
-            filteredFullText.preallocateBytes(estimatedBytes);
-        }
-
-        std::vector<TranscriptEditor::ParagraphTimestamp> paragraphTimestamps;
-        bool isFirstParagraph = true;
-
-        for (size_t i = 0; i < data->timestamps.size(); ++i)
-        {
-            const auto& ts = data->timestamps[i];
-
-            // 只通过时间戳判断是否在当前切片视口内
-            if (ts.startTime >= viewRange.getStart() && ts.startTime < viewRange.getEnd())
-            {
-                // 段落首字：补换行（时间戳不加入文本内容）
-                if (ts.isParagraphStart && !isFirstParagraph)
-                    filteredFullText += "\n";
-
-                auto adjusted = ts;
-                adjusted.globalTextIndex = filteredFullText.length();
-                filteredFullText += ts.character;
-                filteredTimestamps.push_back(adjusted);
-
-                // 记录段落时间戳（单独存储，不参与文本内容）
-                // 视口首字（可能是剪切产生的断点）总是显示时间戳
-                if (paragraphTimestamps.empty())
-                    paragraphTimestamps.push_back({adjusted.globalTextIndex, ts.startTime});
-                else if (ts.isParagraphStart)
-                    paragraphTimestamps.push_back({adjusted.globalTextIndex, ts.startTime});
-
-                isFirstParagraph = false;
-            }
-        }
-
-        transcriptEditor.setText(filteredFullText, juce::dontSendNotification);
-        transcriptEditor.setTimestamps(&filteredTimestamps);
-        transcriptEditor.setParagraphTimestamps(paragraphTimestamps);
-        transcriptEditor.setTimeOffset(getRegionPlaybackStart() - getViewStart());
-        currentTimestamps = &filteredTimestamps;
-        asrButton.setEnabled(true);
-        asrStatusLabel.setText(juce::String::fromUTF8("ASR \xe5\xb7\xb2\xe5\xae\x8c\xe6\x88\x90"),
-                               juce::dontSendNotification);
-        asrStatusLabel.setColour(juce::Label::textColourId, juce::Colours::greenyellow);
+        refreshTrackText();
     }
     else
     {
@@ -526,43 +506,237 @@ void TranscriptPluginEditor::onActiveSourceChanged(juce::ARAAudioSource* source)
 }
 
 //==============================================================================
+//  重织整轨文本 —— 遍历当前 RegionSequence 所有 Regions，
+//  按宿主时间轴顺序拼接，每字时间戳转换为全局时间线
+//==============================================================================
+void TranscriptPluginEditor::refreshTrackText()
+{
+    lastHighlightedCharIndex = -1;
+
+    if (currentRegion == nullptr)
+    {
+        transcriptEditor.clear();
+        transcriptEditor.setTimestamps(nullptr);
+        transcriptEditor.setParagraphTimestamps({});
+        currentTimestamps = nullptr;
+        return;
+    }
+
+    // 获取当前 region 所属的 RegionSequence（对应宿主 Track）
+    currentRegionSequence = currentRegion->getRegionSequence<juce::ARARegionSequence>();
+    if (currentRegionSequence == nullptr)
+    {
+        // 没有序列上下文，降级为只显示当前音频源的单块文本
+        JUCE_BLOCK_WITH_FORCED_SEMICOLON (
+            auto key = TranscriptDataManager::makeSourceKey(
+                currentRegion->getAudioModification<juce::ARAAudioModification>()->getAudioSource());
+            auto* data = dataManager->getDataForKey(key);
+            if (data != nullptr && data->asrComplete)
+            {
+                filteredTimestamps.clear();
+                filteredFullText.clear();
+                filteredFullText.preallocateBytes(data->fullText.length());
+                std::vector<TranscriptEditor::ParagraphTimestamp> paragraphTimestamps;
+                bool isFirst = true;
+                for (const auto& ts : data->timestamps)
+                {
+                    if (ts.isParagraphStart && !isFirst)
+                        filteredFullText += "\n";
+                    auto adj = ts;
+                    adj.globalTextIndex = (int)filteredFullText.length();
+                    filteredFullText += ts.character;
+                    filteredTimestamps.push_back(adj);
+                    if (paragraphTimestamps.empty() || ts.isParagraphStart)
+                        paragraphTimestamps.push_back({adj.globalTextIndex, ts.startTime});
+                    isFirst = false;
+                }
+                transcriptEditor.setText(filteredFullText, juce::dontSendNotification);
+                transcriptEditor.setTimestamps(&filteredTimestamps);
+                transcriptEditor.setParagraphTimestamps(paragraphTimestamps);
+                transcriptEditor.setTimeOffset(0.0);
+                currentTimestamps = &filteredTimestamps;
+            }
+        );
+        return;
+    }
+
+    //── 获取所有 Regions 并按宿主时间轴排序 ──────────
+    const auto& rawRegions = currentRegionSequence->getPlaybackRegions<juce::ARAPlaybackRegion>();
+    if (rawRegions.empty())
+    {
+        transcriptEditor.clear();
+        transcriptEditor.setTimestamps(nullptr);
+        currentTimestamps = nullptr;
+        return;
+    }
+
+    std::vector<juce::ARAPlaybackRegion*> sortedRegions(rawRegions.begin(), rawRegions.end());
+    std::sort(sortedRegions.begin(), sortedRegions.end(),
+        [](const juce::ARAPlaybackRegion* a, const juce::ARAPlaybackRegion* b) {
+            return a->getTimeRange().getStart() < b->getTimeRange().getStart();
+        });
+
+    //── 第一遍：统计总字符数，预分配内存 ────────────
+    size_t estimatedBytes = 0;
+    for (auto* region : sortedRegions)
+    {
+        auto* audioSrc = region->getAudioModification<juce::ARAAudioModification>()->getAudioSource();
+        auto* data = dataManager->getDataForKey(TranscriptDataManager::makeSourceKey(audioSrc));
+        if (data != nullptr && data->asrComplete)
+        {
+            double rStart = region->getStartInAudioModificationTime();
+            double rEnd   = region->getEndInAudioModificationTime();
+            for (const auto& ts : data->timestamps)
+                if (ts.startTime >= rStart && ts.startTime < rEnd)
+                    estimatedBytes += ts.character.length() + 1;
+        }
+        else
+        {
+            estimatedBytes += 50; // 占位符 50 字节
+        }
+    }
+
+    filteredTimestamps.clear();
+    filteredFullText.clear();
+    filteredFullText.preallocateBytes(estimatedBytes);
+
+    //── 第二遍：按宿主时间轴顺序拼接整轨文本 ────────
+    std::vector<TranscriptEditor::ParagraphTimestamp> paragraphTimestamps;
+    bool isFirstParagraph = true;
+
+    for (auto* region : sortedRegions)
+    {
+        auto* audioMod = region->getAudioModification<juce::ARAAudioModification>();
+        auto* audioSrc = audioMod->getAudioSource();
+        auto key = TranscriptDataManager::makeSourceKey(audioSrc);
+        auto* data = dataManager->getDataForKey(key);
+
+        double timelineStart = region->getTimeRange().getStart();
+        double timelineEnd   = region->getTimeRange().getEnd();
+        double audioModStart = region->getStartInAudioModificationTime();
+        double audioModEnd   = region->getEndInAudioModificationTime();
+        double globalOffset  = timelineStart - audioModStart;
+
+        // Region 之间的分隔
+        if (!isFirstParagraph && !filteredFullText.endsWith("\n"))
+            filteredFullText += "\n";
+
+        if (data != nullptr && data->asrComplete)
+        {
+            bool hasContentInRegion = false;
+            for (size_t i = 0; i < data->timestamps.size(); ++i)
+            {
+                const auto& ts = data->timestamps[i];
+
+                // 只取落在这个 region 时间视口内的字符
+                if (ts.startTime < audioModStart || ts.startTime >= audioModEnd)
+                    continue;
+
+                // 段落首字处理
+                if (ts.isParagraphStart && !isFirstParagraph && !filteredFullText.endsWith("\n"))
+                    filteredFullText += "\n";
+
+                auto adjusted = ts;
+                adjusted.globalTextIndex = (int)filteredFullText.length();
+                adjusted.startTime = ts.startTime + globalOffset;
+                adjusted.endTime   = ts.endTime   + globalOffset;
+                filteredFullText += ts.character;
+                filteredTimestamps.push_back(adjusted);
+
+                // 段落时间戳
+                if (paragraphTimestamps.empty())
+                    paragraphTimestamps.push_back({adjusted.globalTextIndex, adjusted.startTime});
+                else if (ts.isParagraphStart)
+                    paragraphTimestamps.push_back({adjusted.globalTextIndex, adjusted.startTime});
+
+                isFirstParagraph = false;
+                hasContentInRegion = true;
+            }
+
+            if (!hasContentInRegion)
+            {
+                // 该 region 在视口内没有任何字符（空切片）
+                filteredFullText += juce::String::fromUTF8("\xe2\x80\xa6"); // …
+            }
+        }
+        else
+        {
+            // 未 ASR 识别的音频块 → 占位提示
+            auto placeholder = juce::String::fromUTF8(
+                "\xe2\x80\xbc[\xe6\x9c\xaa\xe8\xaf\x86\xe5\x88\xab\xe7\x9a\x84"
+                "\xe9\x9f\xb3\xe9\xa2\x91\xe5\x9d\x97]\xe2\x80\xbc");
+            // ‼[未识别的音频块]‼
+
+            CharacterTimestamp pt;
+            pt.character     = placeholder;
+            pt.startTime     = timelineStart;
+            pt.endTime       = timelineEnd;
+            pt.globalTextIndex = (int)filteredFullText.length();
+            pt.isParagraphStart = true;
+            filteredFullText   += placeholder;
+            filteredTimestamps.push_back(pt);
+            paragraphTimestamps.push_back({pt.globalTextIndex, pt.startTime});
+            isFirstParagraph = false;
+        }
+    }
+
+    // 结尾时间以最后一个 Region 的结束位置为准
+    double endTime = sortedRegions.back()->getTimeRange().getEnd();
+
+    transcriptEditor.setText(filteredFullText, juce::dontSendNotification);
+    transcriptEditor.setTimestamps(&filteredTimestamps);
+    transcriptEditor.setParagraphTimestamps(paragraphTimestamps);
+    transcriptEditor.setTimeOffset(0.0);
+    currentTimestamps = &filteredTimestamps;
+    asrButton.setEnabled(true);
+    asrStatusLabel.setText(juce::String::fromUTF8(
+        "\xe6\x95\xb4\xe8\xbd\xa8\xe6\x96\x87\xe6\x9c\xac\xe5\xb7\xb2\xe5\x8a\xa0\xe8\xbd\xbd"),
+                           juce::dontSendNotification);
+    asrStatusLabel.setColour(juce::Label::textColourId, juce::Colours::greenyellow);
+}
+
+//==============================================================================
 //  文本点击 → 通知宿主跳转播放位置
-//  使用 currentRegion->getTimeRange() 实时获取最新时间线位置
+//  findTimeByCharIndex 返回全局时间线时间，直接用于跳转
 //==============================================================================
 void TranscriptPluginEditor::syncTextToAudio(int charIndex)
 {
-    double wordTime = findTimeByCharIndex(charIndex);
-    if (wordTime < 0.0) return;
+    double globalTime = findTimeByCharIndex(charIndex);
+    if (globalTime < 0.0) return;
 
-    waveform.setPlayheadPosition(wordTime);
+    // 波形图仍以当前 region 的源相对时间显示
+    double sourceRelTime = absoluteToSourceTime(globalTime);
+    waveform.setPlayheadPosition(juce::jmax(0.0, sourceRelTime));
 
-    double absoluteHostTime = sourceTimeToAbsolute(wordTime);
-
+    // 全局时间直接通知宿主跳转
     if (auto* editorView = getARAEditorView())
     {
         auto* dc = editorView->getDocumentController();
         if (auto* playbackCtrl = dc->getHostPlaybackController())
-            playbackCtrl->requestSetPlaybackPosition(absoluteHostTime);
+            playbackCtrl->requestSetPlaybackPosition(globalTime);
     }
 }
 
 //==============================================================================
 //  进度条点击 → 高亮文本 + 驱动跳转
+//  点击时间（源相对时间）换算为全局时间线后做高亮与跳转
 //==============================================================================
 void TranscriptPluginEditor::syncAudioToText(double timeInSeconds)
 {
     waveform.setPlayheadPosition(timeInSeconds);
 
-    lastHighlightedCharIndex = -1;
-    transcriptEditor.highlightByTime(timeInSeconds);
+    // 将波形点击的源相对时间转为全局时间线
+    double globalTime = sourceTimeToAbsolute(timeInSeconds);
 
-    // 实时换算为宿主绝对时间线
-    double absoluteHostTime = sourceTimeToAbsolute(timeInSeconds);
+    lastHighlightedCharIndex = -1;
+    transcriptEditor.highlightByTime(globalTime);
+
+    // 全局时间直接用于跳转
     if (auto* editorView = getARAEditorView())
     {
         auto* dc = editorView->getDocumentController();
         if (auto* playbackCtrl = dc->getHostPlaybackController())
-            playbackCtrl->requestSetPlaybackPosition(absoluteHostTime);
+            playbackCtrl->requestSetPlaybackPosition(globalTime);
     }
 }
 
@@ -686,6 +860,7 @@ void TranscriptPluginEditor::cleanupAll()
     lastHighlightedCharIndex = -1;
     filteredTimestamps.clear();
     filteredFullText.clear();
+    currentRegionSequence = nullptr;
 
     // 6. 刷新 UI 到当前选区（显示"无数据"状态）
     if (currentRegion)
