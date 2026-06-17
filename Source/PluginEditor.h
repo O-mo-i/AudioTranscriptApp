@@ -124,6 +124,9 @@ private:
     std::vector<CharacterTimestamp> filteredTimestamps;
     juce::String filteredFullText;
 
+    /** 上次实际传给 TextEditor 的文本，用于跳过重复的 setText */
+    juce::String lastSetText;
+
     //── 播放高亮防抖 ────────────────────────
     int lastHighlightedCharIndex = -1;
 

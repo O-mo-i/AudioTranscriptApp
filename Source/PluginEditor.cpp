@@ -493,6 +493,7 @@ void TranscriptPluginEditor::onActiveSourceChanged(juce::ARAAudioSource* source)
         transcriptEditor.setTimestamps(nullptr);
         transcriptEditor.setParagraphTimestamps({});
         currentTimestamps = nullptr;
+        lastSetText.clear();
         asrButton.setEnabled(false);
         asrStatusLabel.setText(juce::String::fromUTF8(
             "\xe8\xaf\xb7\xe9\x80\x89\xe4\xb8\xad\xe4\xb8\x80\xe4\xb8\xaa\xe9\x9f\xb3"
@@ -513,6 +514,7 @@ void TranscriptPluginEditor::onActiveSourceChanged(juce::ARAAudioSource* source)
         transcriptEditor.clear();
         transcriptEditor.setTimestamps(nullptr);
         currentTimestamps = nullptr;
+        lastSetText.clear();
         asrButton.setEnabled(true);
         asrStatusLabel.setText(juce::String::fromUTF8(
             "\xe7\x82\xb9\xe5\x87\xbb ASR \xe5\xbc\x80\xe5\xa7\x8b\xe8\xaf\x86\xe5\x88\xab"),
@@ -569,7 +571,11 @@ void TranscriptPluginEditor::refreshTrackText()
                         paragraphTimestamps.push_back({adj.globalTextIndex, ts.startTime});
                     isFirst = false;
                 }
-                transcriptEditor.setText(filteredFullText, juce::dontSendNotification);
+                if (filteredFullText != lastSetText)
+                {
+                    lastSetText = filteredFullText;
+                    transcriptEditor.setText(filteredFullText, juce::dontSendNotification);
+                }
                 transcriptEditor.setTimestamps(&filteredTimestamps);
                 transcriptEditor.setParagraphTimestamps(paragraphTimestamps);
                 transcriptEditor.setTimeOffset(0.0);
@@ -744,7 +750,11 @@ void TranscriptPluginEditor::refreshTrackText()
         }
     }
 
-    transcriptEditor.setText(filteredFullText, juce::dontSendNotification);
+    if (filteredFullText != lastSetText)
+    {
+        lastSetText = filteredFullText;
+        transcriptEditor.setText(filteredFullText, juce::dontSendNotification);
+    }
     transcriptEditor.setTimestamps(&filteredTimestamps);
     transcriptEditor.setParagraphTimestamps(paragraphTimestamps);
     transcriptEditor.setTimeOffset(0.0);
@@ -893,6 +903,7 @@ void TranscriptPluginEditor::cleanupAll()
     transcriptEditor.setTimestamps(nullptr);
     transcriptEditor.setParagraphTimestamps({});
     currentTimestamps = nullptr;
+    lastSetText.clear();
     lastHighlightedCharIndex = -1;
     filteredTimestamps.clear();
     filteredFullText.clear();
