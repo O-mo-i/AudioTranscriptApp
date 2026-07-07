@@ -581,7 +581,7 @@ void TranscriptPluginEditor::refreshTrackText()
                 filteredTimestamps.clear();
                 filteredFullText.clear();
                 filteredFullText.preallocateBytes(data->fullText.length());
-                std::vector<TranscriptEditor::ParagraphTimestamp> paragraphTimestamps;
+                std::vector<VirtualTranscriptComponent::ParagraphTimestamp> paragraphTimestamps;
                 bool isFirst = true;
                 for (const auto& ts : data->timestamps)
                 {
@@ -659,7 +659,7 @@ void TranscriptPluginEditor::refreshTrackText()
     filteredFullText.preallocateBytes(estimatedBytes);
 
     //── 第二遍：按宿主时间轴顺序拼接整轨文本（含空隙检测） ──
-    std::vector<TranscriptEditor::ParagraphTimestamp> paragraphTimestamps;
+    std::vector<VirtualTranscriptComponent::ParagraphTimestamp> paragraphTimestamps;
     double lastTimelineEnd = 0.0;
     bool isFirstParagraph = true;
 
@@ -977,12 +977,11 @@ void TranscriptPluginEditor::startASR()
         return;
     }
 
-    juce::File tempFile = juce::File::createTempFile(".wav");
+    // 先校验音频源可用
     {
-        std::unique_ptr<juce::ARAAudioSourceReader> reader(
+        std::unique_ptr<juce::ARAAudioSourceReader> checkReader(
             new juce::ARAAudioSourceReader(activeSrc));
-
-        if (reader->sampleRate <= 0.0 || reader->lengthInSamples <= 0)
+        if (checkReader->sampleRate <= 0.0 || checkReader->lengthInSamples <= 0)
         {
             asrStatusLabel.setText(juce::String::fromUTF8(
                 "\xe6\x97\xa0\xe6\xb3\x95\xe8\xaf\xbb\xe5\x8f\x96\xe9\x9f\xb3\xe9\xa2"
@@ -991,46 +990,9 @@ void TranscriptPluginEditor::startASR()
             asrStatusLabel.setColour(juce::Label::textColourId, juce::Colours::orangered);
             return;
         }
-
-        auto outStream = std::make_unique<juce::FileOutputStream>(tempFile);
-        if (!outStream->openedOk())
-        {
-            asrStatusLabel.setText(juce::String::fromUTF8(
-                "\xe6\x97\xa0\xe6\xb3\x95\xe5\x88\x9b\xe5\xbb\xba\xe4\xb8\xb4\xe6\x97"
-                "\xb6\xe9\x9f\xb3\xe9\xa2\x91\xe6\x96\x87\xe4\xbb\xb6"),
-                                   juce::dontSendNotification);
-            return;
-        }
-
-        juce::WavAudioFormat wavFormat;
-        auto opts = juce::AudioFormatWriterOptions{}
-            .withSampleRate(reader->sampleRate)
-            .withNumChannels((int)reader->numChannels)
-            .withBitsPerSample(16);
-
-        std::unique_ptr<juce::OutputStream> streamPtr = std::move(outStream);
-        auto writer = wavFormat.createWriterFor(streamPtr, opts);
-        if (writer == nullptr)
-        {
-            asrStatusLabel.setText(juce::String::fromUTF8(
-                "\xe6\x97\xa0\xe6\xb3\x95\xe5\x86\x99\xe5\x85\xa5 WAV"),
-                                   juce::dontSendNotification);
-            return;
-        }
-
-        const int blockSize = 65536;
-        juce::AudioBuffer<float> tempBuf((int)reader->numChannels, blockSize);
-        juce::int64 samplesWritten = 0;
-        while (samplesWritten < reader->lengthInSamples)
-        {
-            int toRead = (int)juce::jmin((juce::int64)blockSize,
-                                          reader->lengthInSamples - samplesWritten);
-            reader->read(&tempBuf, 0, toRead, samplesWritten, true, true);
-            writer->writeFromAudioSampleBuffer(tempBuf, 0, toRead);
-            samplesWritten += toRead;
-        }
-        writer->flush();
     }
+
+    juce::File tempFile = juce::File::createTempFile(".wav");
 
     static const std::pair<int, juce::String> models[] = {
         {1, "Qwen/Qwen3-ASR-0.6B"},
@@ -1049,12 +1011,23 @@ void TranscriptPluginEditor::startASR()
     asrProgressValue = 0.0;
     asrProgressBar.setVisible(true);
     asrProgressBar.repaint();
-    asrStatusLabel.setText(juce::String::fromUTF8("ASR \xe8\xaf\x86\xe5\x88\xab\xe4\xb8\xad (")
-                           + chosen + ") ...",
+    asrStatusLabel.setText(juce::String::fromUTF8("\xe6\xad\xa3\xe5\x9c\xa8\xe5\xaf\xbc\xe5\x87\xba WAV ..."),
                            juce::dontSendNotification);
     asrStatusLabel.setColour(juce::Label::textColourId, juce::Colours::yellow);
 
-    asrProcessor.start(tempFile);
-
     tempAudioFile = tempFile;
+
+    // 后台线程完成 WAV 导出 + ASR 识别
+    asrProcessor.onExportProgress = [this](double pct)
+    {
+        asrProgressValue = pct;
+        asrProgressBar.repaint();
+    };
+
+    asrProcessor.startFromSource(
+        [this, activeSrc]() -> std::unique_ptr<juce::AudioFormatReader>
+        {
+            return std::make_unique<juce::ARAAudioSourceReader>(activeSrc);
+        },
+        tempFile);
 }

@@ -34,7 +34,7 @@ struct PlayHeadState
  * 跨轨/跨实例全部指向同一份内存。
  */
 class TranscriptPluginProcessor : public juce::AudioProcessor,
-                                   private juce::AudioProcessorARAExtension
+                                   public juce::AudioProcessorARAExtension
 {
 public:
     TranscriptPluginProcessor();
@@ -63,9 +63,6 @@ public:
     void setStateInformation(const void* data, int sizeInBytes) override;
 
     double getTailLengthSeconds() const override;
-
-    //── ARA ─────────────────────────────────
-    juce::AudioProcessorARAExtension* getARAClientExtensions() override { return this; }
 
     //── 公开数据访问 ─────────────────────────
     /** 返回工程级别全局唯一的 TranscriptDataManager */

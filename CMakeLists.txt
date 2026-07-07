@@ -30,8 +30,8 @@ target_sources(AudioTranscriptEditor
         Source/PluginProcessor.cpp
         Source/PluginEditor.h
         Source/PluginEditor.cpp
-        Source/TranscriptEditor.h
-        Source/TranscriptEditor.cpp
+        Source/VirtualTranscriptComponent.h
+        Source/VirtualTranscriptComponent.cpp
         Source/CharacterTimestamp.h
         Source/ASRProcessor.h
         Source/ASRProcessor.cpp

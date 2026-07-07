@@ -1,6 +1,6 @@
 #pragma once
 #include <juce_audio_processors/juce_audio_processors.h>
-#include "TranscriptEditor.h"
+#include "VirtualTranscriptComponent.h"
 #include "ASRProcessor.h"
 #include "CharacterTimestamp.h"
 
@@ -21,7 +21,7 @@ class TranscriptDataManager;
  * 用户拖动音频块后，点击文字驱动跳转时使用最新的时间线位置。
  */
 class TranscriptPluginEditor : public juce::AudioProcessorEditor,
-                                private juce::AudioProcessorEditorARAExtension,
+                                public juce::AudioProcessorEditorARAExtension,
                                 private juce::Timer,
                                 private juce::ARAEditorView::Listener,
                                 private juce::ARAPlaybackRegion::Listener
@@ -36,7 +36,6 @@ public:
     /** setStateInformation 异步恢复后刷新 UI */
     void refreshAfterStateRestore();
 
-    juce::AudioProcessorEditorARAExtension* getARAClientExtensions() override { return this; }
 
 private:
     //── 内部工具 ────────────────────────────
@@ -97,7 +96,7 @@ private:
     TranscriptPluginProcessor& processor;
     TranscriptDataManager* dataManager = nullptr;
 
-    TranscriptEditor transcriptEditor;
+    VirtualTranscriptComponent transcriptEditor;
 
     void cleanupAll();
 
@@ -131,7 +130,7 @@ private:
         juce::ARARegionSequence* sequence = nullptr;
         juce::String fullText;
         std::vector<CharacterTimestamp> timestamps;
-        std::vector<TranscriptEditor::ParagraphTimestamp> paragraphTimestamps;
+        std::vector<VirtualTranscriptComponent::ParagraphTimestamp> paragraphTimestamps;
     } trackCache;
 
     //── 播放高亮防抖 ────────────────────────

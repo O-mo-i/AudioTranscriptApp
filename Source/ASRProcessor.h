@@ -1,5 +1,7 @@
-﻿#pragma once
+#pragma once
 #include <juce_core/juce_core.h>
+#include <juce_audio_basics/juce_audio_basics.h>
+#include <juce_audio_formats/juce_audio_formats.h>
 #include <functional>
 #include "CharacterTimestamp.h"
 
@@ -8,6 +10,10 @@
  * ASR 后台处理器。
  * 在独立线程中通过 juce::ChildProcess 调用 asr_worker.py，
  * 解析返回的 JSON，填充 CharacterTimestamp 数组。
+ *
+ * 支持两种启动方式：
+ *   start(audioFile)       — 直接处理已存在的 WAV 文件
+ *   startFromSource(...)   — 从 AudioFormatReader 导出 WAV 后再处理（后台线程完成导出）
  *
  * 用法:
  *   ASRProcessor proc;
@@ -22,6 +28,14 @@ public:
 
     /** 启动 ASR 识别（异步，后台线程运行） */
     void start(const juce::File& audioFile);
+
+    /**
+     * 从 AudioFormatReader 导出 WAV 后启动 ASR 识别。
+     * WAV 导出在后台线程完成，不阻塞主线程。
+     * readerFactory 在后台线程中被调用用于创建 reader。
+     */
+    void startFromSource(std::function<std::unique_ptr<juce::AudioFormatReader>()> readerFactory,
+                          const juce::File& outputFile);
 
     /** 下载模型到本地缓存（异步，后台线程运行）。
      *  完成后通过 onDownloadComplete 回调报告结果。
@@ -49,6 +63,9 @@ public:
 
     /** 进度回调（0.0 ~ 1.0，在主线程调用） */
     std::function<void(double progress)> onProgress;
+
+    /** WAV 导出进度回调（0.0 ~ 1.0，在主线程调用） */
+    std::function<void(double progress)> onExportProgress;
 
     /** 下载完成回调（在主线程调用） */
     std::function<void(bool success, const juce::String& message)> onDownloadComplete;
@@ -86,19 +103,31 @@ private:
     enum class ModelOp { kNone, kDownload, kVerify };
 
     void run() override;
-    void callError(const juce::String& msg);
+
+    /** 后台执行 WAV 导出 */
+    bool runWavExport();
+    /** 后台执行 ASR 识别 */
+    void runASR();
+    /** 后台执行模型操作 */
     void runModelOp();
+    void callError(const juce::String& msg);
 
     juce::File audioFile;
     juce::String downloadModelName;
     std::atomic<bool> isActive{ false };
     ModelOp currentModelOp{ ModelOp::kNone };
 
+    /** startFromSource 参数 */
+    std::function<std::unique_ptr<juce::AudioFormatReader>()> readerFactory;
+    juce::File exportFile;
+
     static juce::String pythonPath;
     static juce::String modelName;
     static juce::String deviceName;
     static juce::String scriptsDirectory;
     static juce::String modelDirectory;
+
+    static constexpr int wavExportBlockSize = 65536;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ASRProcessor)
 };

@@ -6,7 +6,6 @@
  #include <windows.h>
 #endif
 
-// 文件日志辅助 — 同时写 DBG 和文件
 static void logToFile(const juce::String& msg)
 {
     DBG(msg);
@@ -20,8 +19,6 @@ juce::File ASRProcessor::getDebugLogFile()
         .getChildFile("asr_debug.log");
 }
 
-// 获取 .vst3 插件 DLL 自身的路径（非宿主路径）
-// 用 VirtualQuery 获取本函数所在内存区域对应的模块基址，再转成文件路径
 #if JUCE_WINDOWS
 static juce::File getPluginDllPath()
 {
@@ -55,7 +52,20 @@ void ASRProcessor::start(const juce::File& file)
 {
     cancel();
     currentModelOp = ModelOp::kNone;
+    readerFactory = nullptr;
     audioFile = file;
+    isActive = true;
+    startThread();
+}
+
+void ASRProcessor::startFromSource(
+    std::function<std::unique_ptr<juce::AudioFormatReader>()> factory,
+    const juce::File& outputFile)
+{
+    cancel();
+    currentModelOp = ModelOp::kNone;
+    readerFactory = std::move(factory);
+    exportFile = outputFile;
     isActive = true;
     startThread();
 }
@@ -87,7 +97,6 @@ void ASRProcessor::cancel()
     }
 }
 
-//==============================================================================
 void ASRProcessor::callError(const juce::String& msg)
 {
     isActive = false;
@@ -102,7 +111,6 @@ void ASRProcessor::callError(const juce::String& msg)
     }
 }
 
-//==============================================================================
 void ASRProcessor::run()
 {
     isActive = true;
@@ -113,38 +121,110 @@ void ASRProcessor::run()
         return;
     }
 
+    if (readerFactory && exportFile.existsAsFile())
+    {
+        if (!runWavExport())
+            return;
+        audioFile = exportFile;
+    }
+
+    runASR();
+}
+
+//==============================================================================
+bool ASRProcessor::runWavExport()
+{
+    logToFile("[ASR] Starting WAV export to: " + exportFile.getFullPathName());
+
+    auto reader = readerFactory();
+    if (reader == nullptr)
+    {
+        callError("Failed to create audio reader for WAV export");
+        return false;
+    }
+
+    auto sampleRate = reader->sampleRate;
+    auto totalSamples = reader->lengthInSamples;
+    auto numChannels = reader->numChannels;
+
+    if (sampleRate <= 0.0 || totalSamples <= 0)
+    {
+        callError("Invalid audio source (sample rate or length is zero)");
+        return false;
+    }
+
+    logToFile("[ASR] Export: " + juce::String(totalSamples) + " samples, "
+              + juce::String(numChannels) + "ch, "
+              + juce::String(sampleRate) + "Hz -> "
+              + juce::String(totalSamples / (int64_t)sampleRate) + "s audio");
+
+    auto outStream = std::make_unique<juce::FileOutputStream>(exportFile);
+    if (!outStream->openedOk())
+    {
+        callError("Cannot create temp WAV file");
+        return false;
+    }
+
+    juce::WavAudioFormat wavFormat;
+    auto writer = wavFormat.createWriterFor(outStream.release(),
+        sampleRate, (unsigned int)numChannels, 16, {}, 0);
+    if (writer == nullptr)
+    {
+        callError("Cannot create WAV writer");
+        return false;
+    }
+
+    juce::AudioBuffer<float> tempBuf((int)numChannels, wavExportBlockSize);
+    int64_t samplesWritten = 0;
+
+    while (samplesWritten < totalSamples && !threadShouldExit())
+    {
+        int toRead = (int)juce::jmin((int64_t)wavExportBlockSize,
+                                      totalSamples - samplesWritten);
+        reader->read(&tempBuf, 0, toRead, samplesWritten, true, true);
+        writer->writeFromAudioSampleBuffer(tempBuf, 0, toRead);
+        samplesWritten += toRead;
+
+        if (onExportProgress && totalSamples > 0)
+        {
+            double pct = (double)samplesWritten / (double)totalSamples;
+            juce::MessageManager::callAsync([this, pct]()
+            {
+                onExportProgress(pct * 0.1);
+            });
+        }
+    }
+
+    writer->flush();
+    delete writer;
+
+    if (threadShouldExit())
+        return false;
+
+    logToFile("[ASR] WAV export complete: "
+              + juce::String(exportFile.getSize() / 1024 / 1024) + " MB");
+    return true;
+}
+
+//==============================================================================
+void ASRProcessor::runASR()
+{
     auto quote = [](const juce::String& s) { return "\"" + s + "\""; };
 
-    // ── 从 .vst3 插件 DLL 自身路径查找 scripts ─────────
-    // 目录结构：
-    //   VST3安装目录/
-    //     scripts/
-    //       asr_worker.py
-    //       .venv/Scripts/python.exe
-    //     Audio Transcript Editor.vst3/
-    //       Contents/x86_64-win/Audio Transcript Editor.vst3  ← DLL 自身
-    //
-    // getPluginDllPath() 返回 DLL 路径，即 .vst3 文件本身。
-    // 向上走两级（x86_64-win/ → Contents/ → .vst3/）得到 .vst3 目录，
-    // 再取父目录即 VST3 安装目录，scripts/ 同级放置。
-    // ──────────────────────────────────────────────────────────
     juce::File vst3Dir;
 
    #if JUCE_WINDOWS
     auto dllFile = getPluginDllPath();
     if (dllFile.exists())
     {
-        // DLL 在 x86_64-win/ 中 → 父目录 → 父目录 = .vst3 目录 → 父目录 = 安装目录
-        auto dllParent = dllFile.getParentDirectory();   // x86_64-win/
-        auto contentsDir = dllParent.getParentDirectory();   // Contents/
-        auto bundleDir   = contentsDir.getParentDirectory(); // .vst3/
-
+        auto dllParent   = dllFile.getParentDirectory();
+        auto contentsDir = dllParent.getParentDirectory();
+        auto bundleDir   = contentsDir.getParentDirectory();
         if (bundleDir.getFileExtension().toLowerCase() == ".vst3")
             vst3Dir = bundleDir.getParentDirectory();
     }
    #endif
 
-    // 开发回退：从构建目录的产物路径定位
     if (vst3Dir == juce::File{})
     {
         auto exeDir = juce::File::getSpecialLocation(
@@ -178,7 +258,6 @@ void ASRProcessor::run()
     logToFile("[ASR] script: " + pythonScriptFile.getFullPathName());
     logToFile("[ASR] audio : " + audioFile.getFullPathName());
 
-    // 构建命令行
     juce::String cmd;
     cmd << quote(pythonExeFile.getFullPathName())
         << " " << quote(pythonScriptFile.getFullPathName())
@@ -186,10 +265,8 @@ void ASRProcessor::run()
         << " --device " << deviceName
         << " --model " << quote(modelName);
 
-    // 始终离线运行（模型必须已在本地缓存）
     cmd << " --offline";
 
-    // 本地模型目录
     if (modelDirectory.isNotEmpty())
         cmd << " --model-dir " << quote(modelDirectory);
 
@@ -198,15 +275,13 @@ void ASRProcessor::run()
 
     logToFile("[ASR] cmd: " + cmd);
 
-    // 启动子进程（同时捕获 stdout 和 stderr）
     juce::ChildProcess proc;
     if (!proc.start(cmd, juce::ChildProcess::wantStdOut | juce::ChildProcess::wantStdErr))
     {
-        callError("Failed to start Python process. Make sure Python is installed and on PATH.");
+        callError("Failed to start Python process.");
         return;
     }
 
-    // ── 按行流式读取子进程输出 ──────────────────────────
     juce::MemoryBlock lineBuf;
     juce::String jsonLine;
     char readBuf[4096];
@@ -238,7 +313,7 @@ void ASRProcessor::run()
                             {
                                 juce::MessageManager::callAsync([this, pct]()
                                 {
-                                    onProgress(juce::jlimit(0.0, 1.0, pct / 100.0));
+                                    onProgress(juce::jlimit(0.0, 1.0, 0.1 + 0.9 * (pct / 100.0)));
                                 });
                             }
                         }
@@ -262,12 +337,10 @@ void ASRProcessor::run()
         }
     }
 
-    // 进程退出后，读取残余数据
     char tail[4096];
     while (auto n = proc.readProcessOutput(tail, sizeof(tail)))
         lineBuf.append(tail, n);
 
-    // 处理最后一行（可能没有换行结尾）
     if (lineBuf.getSize() > 0)
     {
         auto* data = static_cast<const char*>(lineBuf.getData());
@@ -278,7 +351,6 @@ void ASRProcessor::run()
             jsonLine = lastLine;
     }
 
-    // ── 解析 JSON ───────────────────────────────────────
     logToFile("[ASR] process exit code: " + juce::String(proc.getExitCode()));
     logToFile("[ASR] jsonLine length: " + juce::String(jsonLine.length()) + " chars");
 
@@ -304,7 +376,6 @@ void ASRProcessor::run()
         return;
     }
 
-    // 解析 words -> CharacterTimestamp
     auto wordsVar = json["words"];
     if (!wordsVar.isArray())
     {
@@ -315,6 +386,9 @@ void ASRProcessor::run()
     std::vector<CharacterTimestamp> timestamps;
     juce::String fullText;
     auto* arr = wordsVar.getArray();
+
+    timestamps.reserve((size_t)arr->size());
+    fullText.preallocateBytes(fullText.length() + jsonLine.length() / 2);
 
     bool isFirstParagraph = true;
 
@@ -345,20 +419,15 @@ void ASRProcessor::run()
 
     isActive = false;
 
-    // === 诊断：校验 C++ 实际收到的字符数 ===
     logToFile("====== [ASR DATA CHECK] ======");
     logToFile("Total characters parsed in C++: " + juce::String((int)timestamps.size()));
     if (!timestamps.empty())
     {
         logToFile("First char startTime: " + juce::String(timestamps.front().startTime));
         logToFile("Last char startTime:  " + juce::String(timestamps.back().startTime));
-        logToFile("First char text: \"" + timestamps.front().character + "\"");
-        logToFile("Last char text:  \"" + timestamps.back().character + "\"");
     }
-    logToFile("jsonLine length:   " + juce::String((int)jsonLine.length()) + " chars");
     logToFile("================================");
 
-    // 回调到主线程
     if (onResult && !threadShouldExit())
     {
         juce::MessageManager::callAsync([this, timestamps, fullText]()
@@ -375,14 +444,13 @@ void ASRProcessor::runModelOp()
         currentModelOp == ModelOp::kDownload ? "download" : "verify")
         + ") for: " + downloadModelName);
 
-    // 复用 run() 中的路径解析逻辑，提取 vst3Dir
     juce::File vst3Dir;
 
    #if JUCE_WINDOWS
     auto dllFile = getPluginDllPath();
     if (dllFile.exists())
     {
-        auto dllParent = dllFile.getParentDirectory();
+        auto dllParent   = dllFile.getParentDirectory();
         auto contentsDir = dllParent.getParentDirectory();
         auto bundleDir   = contentsDir.getParentDirectory();
         if (bundleDir.getFileExtension().toLowerCase() == ".vst3")
@@ -435,7 +503,6 @@ void ASRProcessor::runModelOp()
         return;
     }
 
-    // 读取 stdout（JSON 结果行）
     juce::String jsonLine;
     char buf[4096];
     while (proc.isRunning() && !threadShouldExit())
@@ -448,7 +515,6 @@ void ASRProcessor::runModelOp()
                 line = line.trim();
                 if (line.startsWith("PROGRESS:"))
                 {
-                    // 暂不处理下载进度
                 }
                 else if (line.startsWith("{") && line.endsWith("}"))
                 {
@@ -462,7 +528,6 @@ void ASRProcessor::runModelOp()
         }
     }
 
-    // 残余输出
     char tail[4096];
     while (auto n = proc.readProcessOutput(tail, sizeof(tail)))
     {
@@ -506,7 +571,6 @@ void ASRProcessor::runModelOp()
     }
 }
 
-//==============================================================================
 void ASRProcessor::setPythonPath(const juce::String& path)      { pythonPath = path; }
 void ASRProcessor::setModelName(const juce::String& m)         { modelName  = m; }
 void ASRProcessor::setDevice(const juce::String& d)            { deviceName = d; }
