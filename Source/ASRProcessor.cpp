@@ -66,6 +66,7 @@ void ASRProcessor::startFromSource(
     currentModelOp = ModelOp::kNone;
     readerFactory = std::move(factory);
     exportFile = outputFile;
+    audioFile = {};
     isActive = true;
     startThread();
 }
@@ -121,8 +122,14 @@ void ASRProcessor::run()
         return;
     }
 
-    if (readerFactory && exportFile.existsAsFile())
+    if (readerFactory)
     {
+        if (!exportFile.existsAsFile())
+        {
+            callError("Temporary audio file not found: "
+                      + exportFile.getFullPathName());
+            return;
+        }
         if (!runWavExport())
             return;
         audioFile = exportFile;
@@ -251,6 +258,13 @@ void ASRProcessor::runASR()
     {
         callError("Script not found at: " + pythonScriptFile.getFullPathName()
                   + "\nPlease copy the 'scripts' folder next to the VST3 plugin.");
+        return;
+    }
+
+    if (!audioFile.existsAsFile())
+    {
+        callError("Audio file missing before ASR: "
+                  + audioFile.getFullPathName());
         return;
     }
 

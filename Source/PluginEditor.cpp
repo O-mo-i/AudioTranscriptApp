@@ -992,7 +992,23 @@ void TranscriptPluginEditor::startASR()
         }
     }
 
-    juce::File tempFile = juce::File::createTempFile(".wav");
+    auto tempDir = juce::File::getSpecialLocation(
+        juce::File::userApplicationDataDirectory)
+        .getChildFile("AudioTranscriptApp").getChildFile("temp");
+    tempDir.createDirectory();
+    // 清理上次残留的临时文件
+    for (auto& f : tempDir.findChildFiles(juce::File::findFiles, false, "asr_export_*.wav"))
+        f.deleteFile();
+    juce::File tempFile = tempDir.getNonexistentChildFile("asr_export_", ".wav");
+    if (tempFile == juce::File{} || !tempFile.create())
+    {
+        asrStatusLabel.setText(juce::String::fromUTF8(
+            "\xe6\x97\xa0\xe6\xb3\x95\xe5\x88\x9b\xe5\xbb\xba\xe4\xb8\xb4\xe6\x97\xb6"
+            "\xe6\x96\x87\xe4\xbb\xb6: ") + tempFile.getFullPathName(),
+                               juce::dontSendNotification);
+        asrStatusLabel.setColour(juce::Label::textColourId, juce::Colours::orangered);
+        return;
+    }
 
     static const std::pair<int, juce::String> models[] = {
         {1, "Qwen/Qwen3-ASR-0.6B"},
