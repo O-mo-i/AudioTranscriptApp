@@ -35,6 +35,16 @@ public:
 
     std::function<void(int charIndex)> onCaretMoved;
     std::function<bool()> onSpacePressed;
+    std::function<void()> onSearchRequested;
+
+    //── 搜索 API ────────────────────────────
+    void searchText(const juce::String& keyword);
+    void goToNextMatch();
+    void goToPrevMatch();
+    void clearSearch();
+    int getSearchMatchCount() const { return (int)searchMatches.size(); }
+    bool hasSearchResults() const { return !searchMatches.empty(); }
+    int getCurrentSearchMatchIndex() const { return currentSearchMatch; }
 
 private:
     //── 内部画布：只绘制视口内可见的行 ──────────
@@ -80,6 +90,9 @@ private:
     /** 将鼠标坐标（相对于 Canvas）转换为字符索引 */
     int hitTestCharIndex(int canvasX, int canvasY) const;
 
+    /** 滚动视口到当前搜索匹配位置 */
+    void scrollToCurrentMatch();
+
     /** 根据当前宽度和全文重建显示行 */
     void rebuildDisplayLines();
 
@@ -110,6 +123,16 @@ private:
     //── 文字选择 ────────────────────────────
     int selectionStart = -1;
     int selectionEnd = -1;
+
+    //── 搜索 ──────────────────────────────
+    struct SearchMatch
+    {
+        int startIndex = 0;
+        int endIndex = 0;
+    };
+    std::vector<SearchMatch> searchMatches;
+    int currentSearchMatch = -1;
+    juce::String searchKeyword;
 
     //── 子组件 ──────────────────────────────
     TranscriptViewport viewport;

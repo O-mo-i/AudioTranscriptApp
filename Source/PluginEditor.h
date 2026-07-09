@@ -98,7 +98,15 @@ private:
 
     VirtualTranscriptComponent transcriptEditor;
 
+    //── 搜索控件 ────────────────────────────
+    juce::TextEditor searchBox;
+    juce::Label searchCountLabel;
+    juce::TextButton prevSearchButton;
+    juce::TextButton nextSearchButton;
+    juce::TextButton closeSearchButton;
+
     void cleanupAll();
+    void updateSearchCountLabel();
 
     // ASR 控件
     juce::ComboBox modelSelector;

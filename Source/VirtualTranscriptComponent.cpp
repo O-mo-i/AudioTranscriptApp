@@ -63,6 +63,7 @@ void VirtualTranscriptComponent::setText(const juce::String& text, juce::Notific
     lastHighlightedIndex = -1;
     highlightTime = -1.0;
     selectionStart = selectionEnd = -1;
+    clearSearch();
 }
 
 void VirtualTranscriptComponent::clear()
@@ -294,6 +295,33 @@ void VirtualTranscriptComponent::Canvas::paint(juce::Graphics& g)
             }
         }
 
+        //── 搜索高亮 ──────────────────────
+        if (!vt.searchMatches.empty())
+        {
+            int lineStart = line.startCharIndex;
+            int lineEnd   = lineStart + line.text.length();
+
+            for (int mi = 0; mi < (int)vt.searchMatches.size(); ++mi)
+            {
+                const auto& sm = vt.searchMatches[mi];
+                if (sm.startIndex < lineEnd && sm.endIndex > lineStart)
+                {
+                    int localStart = juce::jmax(0, sm.startIndex - lineStart);
+                    int localEnd   = juce::jmin((int)line.text.length(), sm.endIndex - lineStart);
+
+                    float sx = x + textFont.getStringWidth(line.text.substring(0, localStart));
+                    float sw = textFont.getStringWidth(line.text.substring(localStart, localEnd));
+
+                    if (mi == vt.currentSearchMatch)
+                        g.setColour(juce::Colour(0xFF1E90FF)); // 当前匹配：亮蓝
+                    else
+                        g.setColour(juce::Colour(0x804A90D9)); // 其他匹配：半透明蓝
+
+                    g.fillRect(sx, (float)y, sw, (float)vt.lineHeight);
+                }
+            }
+        }
+
         //── 文字选中背景（用户拖选）─────────
         if (vt.selectionStart >= 0 && vt.selectionEnd >= 0
             && vt.selectionStart != vt.selectionEnd)
@@ -335,7 +363,83 @@ void VirtualTranscriptComponent::Canvas::paint(juce::Graphics& g)
 }
 
 //==============================================================================
-//  鼠标坐标 → 字符索引（坐标相对于 Canvas）
+//  搜索
+//==============================================================================
+void VirtualTranscriptComponent::searchText(const juce::String& keyword)
+{
+    searchMatches.clear();
+    currentSearchMatch = -1;
+    searchKeyword = keyword;
+
+    if (keyword.isEmpty())
+    {
+        canvas.repaint();
+        return;
+    }
+
+    int pos = 0;
+    while ((pos = fullText.indexOf(pos, keyword)) >= 0)
+    {
+        searchMatches.push_back({pos, pos + keyword.length()});
+        pos += keyword.length();
+    }
+
+    if (!searchMatches.empty())
+        currentSearchMatch = 0;
+
+    scrollToCurrentMatch();
+    canvas.repaint();
+}
+
+void VirtualTranscriptComponent::goToNextMatch()
+{
+    if (searchMatches.empty()) return;
+
+    currentSearchMatch = (currentSearchMatch + 1) % (int)searchMatches.size();
+    scrollToCurrentMatch();
+    canvas.repaint();
+}
+
+void VirtualTranscriptComponent::goToPrevMatch()
+{
+    if (searchMatches.empty()) return;
+
+    currentSearchMatch = currentSearchMatch - 1;
+    if (currentSearchMatch < 0)
+        currentSearchMatch = (int)searchMatches.size() - 1;
+    scrollToCurrentMatch();
+    canvas.repaint();
+}
+
+void VirtualTranscriptComponent::clearSearch()
+{
+    searchMatches.clear();
+    currentSearchMatch = -1;
+    searchKeyword.clear();
+    canvas.repaint();
+}
+
+void VirtualTranscriptComponent::scrollToCurrentMatch()
+{
+    if (currentSearchMatch < 0 || currentSearchMatch >= (int)searchMatches.size())
+        return;
+
+    const auto& match = searchMatches[currentSearchMatch];
+    for (size_t i = 0; i < displayLines.size(); ++i)
+    {
+        const auto& line = displayLines[i];
+        int lineEnd = line.startCharIndex + (int)line.text.length();
+        if (match.startIndex >= line.startCharIndex && match.startIndex < lineEnd)
+        {
+            int targetY = (int)i * lineHeight;
+            auto curPos = viewport.getViewPosition();
+            int visibleHeight = viewport.getMaximumVisibleHeight();
+            if (targetY < curPos.y || targetY + lineHeight > curPos.y + visibleHeight)
+                viewport.setViewPosition(curPos.x, targetY);
+            break;
+        }
+    }
+}
 //==============================================================================
 int VirtualTranscriptComponent::hitTestCharIndex(int canvasX, int canvasY) const
 {
@@ -435,6 +539,16 @@ bool VirtualTranscriptComponent::keyPressed(const juce::KeyPress& key)
             return true;
         return true;
     }
+
+    // Ctrl+F / Cmd+F 打开搜索
+    if ((key.getModifiers().isCtrlDown() || key.getModifiers().isCommandDown())
+        && key.getKeyCode() == 'F')
+    {
+        if (onSearchRequested)
+            onSearchRequested();
+        return true;
+    }
+
     return false;
 }
 

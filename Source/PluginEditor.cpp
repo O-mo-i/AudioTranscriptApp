@@ -73,6 +73,11 @@ TranscriptPluginEditor::TranscriptPluginEditor(TranscriptPluginProcessor& p)
     addAndMakeVisible(transcriptEditor);
     transcriptEditor.setTimestamps(nullptr);
     transcriptEditor.onCaretMoved = [this](int i) { syncTextToAudio(i); };
+    transcriptEditor.onSearchRequested = [this]()
+    {
+        searchBox.grabKeyboardFocus();
+    };
+
     transcriptEditor.onSpacePressed = [this]() -> bool
     {
         auto& phs = processor.getPlayHeadState();
@@ -94,9 +99,6 @@ TranscriptPluginEditor::TranscriptPluginEditor(TranscriptPluginProcessor& p)
 
     //── ASR 控件 ────────────────────────────
     modelSelector.addItem("Qwen/Qwen3-ASR-0.6B", 1);
-    modelSelector.addItem("openai/whisper-small", 2);
-    modelSelector.addItem("openai/whisper-medium", 3);
-    modelSelector.addItem("openai/whisper-large-v3", 4);
     modelSelector.setSelectedId(1);
     modelSelector.setTooltip(juce::String::fromUTF8("\xe9\x80\x89\xe6\x8b\xa9 ASR \xe8\xaf\x86\xe5\x88\xab\xe6\xa8\xa1\xe5\x9e\x8b"));
     addAndMakeVisible(modelSelector);
@@ -189,6 +191,50 @@ TranscriptPluginEditor::TranscriptPluginEditor(TranscriptPluginProcessor& p)
         asrProgressBar.repaint();
     };
 
+    //── 搜索控件 ────────────────────────────
+    searchBox.setMultiLine(false);
+    searchBox.setReturnKeyStartsNewLine(false);
+    searchBox.setSelectAllWhenFocused(true);
+    searchBox.setTextToShowWhenEmpty(juce::String::fromUTF8("\xe6\x90\x9c\xe7\xb4\xa2..."),
+                                     juce::Colours::grey);
+    searchBox.setFont(juce::Font("Microsoft YaHei", 16.0f, juce::Font::plain));
+    searchBox.onTextChange = [this]()
+    {
+        transcriptEditor.searchText(searchBox.getText());
+        updateSearchCountLabel();
+    };
+    addAndMakeVisible(searchBox);
+
+    searchCountLabel.setJustificationType(juce::Justification::centred);
+    searchCountLabel.setColour(juce::Label::textColourId, juce::Colours::lightgrey);
+    searchCountLabel.setFont(juce::Font("Microsoft YaHei", 14.0f, juce::Font::plain));
+    addAndMakeVisible(searchCountLabel);
+
+    prevSearchButton.setButtonText(juce::String::fromUTF8("\xe4\xb8\x8a\xe4\xb8\x80\xe4\xb8\xaa"));
+    prevSearchButton.onClick = [this]()
+    {
+        transcriptEditor.goToPrevMatch();
+        updateSearchCountLabel();
+    };
+    addAndMakeVisible(prevSearchButton);
+
+    nextSearchButton.setButtonText(juce::String::fromUTF8("\xe4\xb8\x8b\xe4\xb8\x80\xe4\xb8\xaa"));
+    nextSearchButton.onClick = [this]()
+    {
+        transcriptEditor.goToNextMatch();
+        updateSearchCountLabel();
+    };
+    addAndMakeVisible(nextSearchButton);
+
+    closeSearchButton.setButtonText("X");
+    closeSearchButton.onClick = [this]()
+    {
+        searchBox.setText({}, juce::dontSendNotification);
+        transcriptEditor.clearSearch();
+        updateSearchCountLabel();
+    };
+    addAndMakeVisible(closeSearchButton);
+
     startTimerHz(30);
     selectionPollCounter = 0;
 
@@ -257,6 +303,24 @@ void TranscriptPluginEditor::resized()
 
     auto topStrip = bounds.removeFromTop(28);
     asrStatusLabel.setBounds(topStrip);
+
+    //── 搜索栏 ──────────────────────────────
+    auto searchBar = bounds.removeFromTop(30);
+    int x = searchBar.getX() + 4;
+    int cy = searchBar.getY() + searchBar.getHeight() / 2;
+
+    // 搜索输入框（占据剩余宽度）
+    int btnAreaW = 28 + 62 + 62 + 80 + 4 * 4; // close + next + prev + count + gaps
+    searchBox.setBounds(x, cy - 12, searchBar.getWidth() - btnAreaW - 4 * 2, 24);
+
+    x = searchBox.getRight() + 4;
+    searchCountLabel.setBounds(x, cy - 12, 80, 24);
+    x = searchCountLabel.getRight() + 4;
+    prevSearchButton.setBounds(x, cy - 12, 62, 24);
+    x = prevSearchButton.getRight() + 4;
+    nextSearchButton.setBounds(x, cy - 12, 62, 24);
+    x = nextSearchButton.getRight() + 4;
+    closeSearchButton.setBounds(x, cy - 12, 28, 24);
 
     transcriptEditor.setBounds(bounds);
 
@@ -833,15 +897,28 @@ double TranscriptPluginEditor::findTimeByCharIndex(int charIndex) const
 }
 
 //==============================================================================
+//  更新搜索计数标签
+//==============================================================================
+void TranscriptPluginEditor::updateSearchCountLabel()
+{
+    int total = transcriptEditor.getSearchMatchCount();
+    int current = transcriptEditor.getCurrentSearchMatchIndex();
+
+    if (total > 0 && current >= 0)
+        searchCountLabel.setText(juce::String(current + 1) + "/" + juce::String(total),
+                                 juce::dontSendNotification);
+    else
+        searchCountLabel.setText(juce::String::fromUTF8("\xe6\x97\xa0\xe7\xbb\x93\xe6\x9e\x9c"),
+                                 juce::dontSendNotification);
+}
+
+//==============================================================================
 //  下载模型到本地缓存
 //==============================================================================
 void TranscriptPluginEditor::downloadModel()
 {
     static const std::pair<int, juce::String> models[] = {
         {1, "Qwen/Qwen3-ASR-0.6B"},
-        {2, "openai/whisper-small"},
-        {3, "openai/whisper-medium"},
-        {4, "openai/whisper-large-v3"},
     };
     juce::String chosen = "Qwen/Qwen3-ASR-0.6B";
     for (auto& m : models)
@@ -875,9 +952,6 @@ void TranscriptPluginEditor::verifyModel()
 {
     static const std::pair<int, juce::String> models[] = {
         {1, "Qwen/Qwen3-ASR-0.6B"},
-        {2, "openai/whisper-small"},
-        {3, "openai/whisper-medium"},
-        {4, "openai/whisper-large-v3"},
     };
     juce::String chosen = "Qwen/Qwen3-ASR-0.6B";
     for (auto& m : models)
@@ -1010,19 +1084,9 @@ void TranscriptPluginEditor::startASR()
         return;
     }
 
-    static const std::pair<int, juce::String> models[] = {
-        {1, "Qwen/Qwen3-ASR-0.6B"},
-        {2, "openai/whisper-small"},
-        {3, "openai/whisper-medium"},
-        {4, "openai/whisper-large-v3"},
-    };
     juce::String chosen = "Qwen/Qwen3-ASR-0.6B";
-    for (auto& m : models)
-    {
-        if (m.first == modelSelector.getSelectedId()) { chosen = m.second; break; }
-    }
-
     asrProcessor.setModelName(chosen);
+
     asrButton.setEnabled(false);
     asrProgressValue = 0.0;
     asrProgressBar.setVisible(true);
