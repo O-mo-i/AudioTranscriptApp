@@ -1,6 +1,10 @@
 # Build
 Build/
 cmake-build-*/
+build/
+
+# ARA SDK (external dependency)
+ARA_SDK/
 
 # JUCE framework (external dependency)
 JUCE/

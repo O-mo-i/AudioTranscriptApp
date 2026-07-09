@@ -10,7 +10,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 add_subdirectory(JUCE)
 
 # ARA SDK 路径（Celemony ARA_SDK v2.3.0）
-juce_set_ara_sdk_path("${CMAKE_CURRENT_SOURCE_DIR}/../ARA_SDK")
+juce_set_ara_sdk_path("${CMAKE_CURRENT_SOURCE_DIR}/ARA_SDK")
 
 juce_add_plugin(AudioTranscriptEditor
     PRODUCT_NAME             "Audio Transcript Editor"
